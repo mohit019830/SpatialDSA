@@ -32,7 +32,14 @@
 (function () {
   // Landmark indices we care about (MediaPipe Hand topology).
   const THUMB_TIP = 4;
-  const INDEX_TIP = 8;
+  const INDEX_TIP = 8;      // index fingertip
+  const INDEX_PIP = 6;      // index proximal-interphalangeal joint
+  const MIDDLE_TIP = 12;    // middle fingertip
+  const MIDDLE_PIP = 10;    // middle PIP joint
+  const RING_TIP = 16;
+  const RING_PIP = 14;
+  const PINKY_TIP = 20;
+  const PINKY_PIP = 18;
 
   // Hand skeleton connections for the telemetry overlay.
   const HAND_CONNECTIONS = [
@@ -57,6 +64,16 @@
   // Double-pinch timing gate. Two discrete pinch-down edges closer together
   // than this (ms) count as a "double pinch" — the node-creation trigger.
   const DOUBLE_PINCH_MS = 300;
+
+  // Two-handed ZOOM (Ultron replica). Each hand must be independently pinched
+  // (tight thumb-index distance) for the dual-pinch zoom gesture to engage.
+  const ZOOM_PINCH = 0.03;         // per-hand thumb↔index distance to count as pinched
+
+  // LINKING POSE (two-finger pointer for edge connection). Index + middle
+  // extended, ring + pinky curled. Extended = tip is ABOVE its PIP joint in the
+  // image (smaller y). CURL_MARGIN adds a small deadband so a half-bent finger
+  // doesn't flip the pose state per frame.
+  const CURL_MARGIN = 0.02;
 
   // Velocity-based swipe (frame-velocity ring buffer over the index fingertip).
   // Instead of requiring a big absolute sweep, we fire on a *sharp flick*: high
@@ -97,11 +114,18 @@
       // Frame throttling counter.
       this._frameCount = 0;
 
-      // Debounced pinch state.
+      // Debounced pinch state (primary hand).
       this._pinch = false;
       // Double-pinch timing gate: time of the last pinch-DOWN edge.
       this._lastPinchTime = 0;
       this._pinchCount = 0;
+
+      // Two-handed zoom: baseline inter-hand distance captured on the first
+      // frame both hands are pinched. null when zoom mode is inactive.
+      this._zoomBase = null;
+
+      // Linking pose latch (index+middle extended, ring+pinky curled).
+      this._linking = false;
 
       // Presence + interpolation state.
       this._present = false;
@@ -143,7 +167,7 @@
             delegate: 'GPU',
           },
           runningMode: 'VIDEO',
-          numHands: 1,
+          numHands: 2,
           minHandDetectionConfidence: 0.6,
           minHandPresenceConfidence: 0.6,
           minTrackingConfidence: 0.6,
@@ -262,11 +286,13 @@
       const result = this.landmarker.detectForVideo(this.video, now);
       this._syncOverlaySize();
 
-      const hasHand = result && result.landmarks && result.landmarks.length > 0;
-      if (!hasHand) {
+      const handCount = result && result.landmarks ? result.landmarks.length : 0;
+      if (handCount === 0) {
         this._present = false;
         this._pinch = false;
         this._pinchCount = 0;
+        this._zoomBase = null;
+        this._linking = false;
         this._track.length = 0;
         this._lastReal = null;
         this._prevReal = null;
@@ -276,9 +302,37 @@
         return;
       }
 
-      // Mirror X so on-screen motion matches the user (selfie view).
-      const lm = result.landmarks[0].map((p) => ({ x: 1 - p.x, y: p.y, z: p.z }));
+      // Mirror X on every detected hand so on-screen motion matches the user
+      // (selfie view). hands[0] is treated as the PRIMARY (cursor) hand.
+      const hands = result.landmarks.map((h) =>
+        h.map((p) => ({ x: 1 - p.x, y: p.y, z: p.z }))
+      );
+      const lm = hands[0];
       this._lastLandmarks = lm;
+
+      /* ================================================================== *
+       * TWO-HANDED PINCH → ZOOM (highest-priority path).                    *
+       * Both hands pinched → emit a smoothed zoom scalar and skip the       *
+       * single-hand rotate/link machinery for this frame.                  *
+       * ================================================================== */
+      if (handCount === 2) {
+        const zoom = this._detectZoom(hands);
+        if (zoom !== null) {
+          // Zoom owns the frame: reset single-hand latches so releasing the
+          // second hand doesn't leave a stale pinch/link armed.
+          this._pinch = false;
+          this._linking = false;
+          this._track.length = 0;
+          this._drawOverlayDual(hands);
+          this.onFrame(
+            this._event(true, null, false, false, null, false, { zoom, landmarks: lm })
+          );
+          return;
+        }
+      } else {
+        // Dropped back to one (or zero) hands — clear any zoom baseline.
+        this._zoomBase = null;
+      }
 
       // ---- Pinch: 3D Euclidean distance with SPLIT-THRESHOLD hysteresis --
       // Starting a pinch requires a deliberately tight distance (PINCH_START),
@@ -317,22 +371,89 @@
       if (this._track.length > SWIPE_BUFFER) this._track.shift();
       const swipe = this._detectSwipe(now);
 
+      // ---- Linking pose (index+middle extended, ring+pinky curled) ------
+      // Latched with a margin so a half-curl doesn't chatter. We surface the
+      // rising/falling edges so app.js can start / commit the temp edge line.
+      const wasLinking = this._linking;
+      this._linking = this._detectLinkingPose(lm);
+      const linkStart = !wasLinking && this._linking;
+      const linkEnd = wasLinking && !this._linking;
+
       // ---- Record measured fingertip samples for extrapolation ----------
       this._present = true;
       this._prevReal = this._lastReal;
       this._lastReal = { x: i.x, y: i.y, t: now };
 
       // ---- Telemetry overlay (only on detection frames) -----------------
-      this._drawOverlay(lm, d, this._pinch);
+      this._drawOverlay(lm, d, this._pinch, this._linking);
 
       this.onFrame(
         this._event(true, { x: i.x, y: i.y }, this._pinch, false, swipe, false, {
           pinchStart,
           pinchEnd,
           doublePinch,
+          linking: this._linking,
+          linkStart,
+          linkEnd,
           landmarks: lm,
         })
       );
+    }
+
+    /* ---------------------------------------------------------------------
+     * TWO-HANDED ZOOM detector. Returns a smoothing-ready zoom scalar:
+     *   > 0  hands spreading  → zoom IN
+     *   < 0  hands closing    → zoom OUT
+     * or null when the dual-pinch is not active. The scalar is the signed
+     * delta of the current inter-hand distance vs the captured baseline; the
+     * 0.1 camera lerp lives in render3d, keeping this module transform-free.
+     * ------------------------------------------------------------------ */
+    _detectZoom(hands) {
+      const aPinch = this._handPinchDist(hands[0]) < ZOOM_PINCH;
+      const bPinch = this._handPinchDist(hands[1]) < ZOOM_PINCH;
+      if (!(aPinch && bPinch)) {
+        this._zoomBase = null;
+        return null;
+      }
+
+      // Pinch centroid of each hand (midpoint of thumb+index tips), full 3D.
+      const ca = this._pinchPoint(hands[0]);
+      const cb = this._pinchPoint(hands[1]);
+      const dist = Math.sqrt(
+        (ca.x - cb.x) ** 2 + (ca.y - cb.y) ** 2 + (ca.z - cb.z) ** 2
+      );
+
+      if (this._zoomBase === null) {
+        // First frame of the dual-pinch: capture baseline, no movement yet.
+        this._zoomBase = dist;
+        return 0;
+      }
+      return dist - this._zoomBase;   // signed spread; render3d applies the lerp
+    }
+
+    /** Thumb↔index 3D distance for an arbitrary hand's landmark array. */
+    _handPinchDist(h) {
+      const t = h[THUMB_TIP], i = h[INDEX_TIP];
+      return Math.sqrt((i.x - t.x) ** 2 + (i.y - t.y) ** 2 + (i.z - t.z) ** 2);
+    }
+
+    /** Midpoint of thumb + index tips — the "pinch coordinate" of a hand. */
+    _pinchPoint(h) {
+      const t = h[THUMB_TIP], i = h[INDEX_TIP];
+      return { x: (t.x + i.x) / 2, y: (t.y + i.y) / 2, z: (t.z + i.z) / 2 };
+    }
+
+    /* ---------------------------------------------------------------------
+     * LINKING POSE: index + middle EXTENDED, ring + pinky CURLED.
+     * A finger is "extended" when its tip sits above (smaller y) its PIP joint,
+     * "curled" when the tip drops below the PIP. CURL_MARGIN is a deadband.
+     * ------------------------------------------------------------------ */
+    _detectLinkingPose(h) {
+      const idxExt = h[INDEX_TIP].y < h[INDEX_PIP].y - CURL_MARGIN;
+      const midExt = h[MIDDLE_TIP].y < h[MIDDLE_PIP].y - CURL_MARGIN;
+      const ringCurl = h[RING_TIP].y > h[RING_PIP].y + CURL_MARGIN;
+      const pinkyCurl = h[PINKY_TIP].y > h[PINKY_PIP].y + CURL_MARGIN;
+      return idxExt && midExt && ringCurl && pinkyCurl;
     }
 
     /* ---------------------------------------------------------------------
@@ -364,8 +485,13 @@
         cursor = { x: this._lastReal.x, y: this._lastReal.y };
       }
 
-      // Carry the debounced pinch state forward; edges only fire on real frames.
-      this.onFrame(this._event(true, cursor, this._pinch, true, null, true));
+      // Carry debounced pinch + linking state forward; edges only fire on real
+      // frames. The interpolated cursor still moves the temp link line smoothly.
+      this.onFrame(
+        this._event(true, cursor, this._pinch, true, null, true, {
+          linking: this._linking,
+        })
+      );
     }
 
     /* ---------------------------------------------------------------------
@@ -379,6 +505,12 @@
         pinchStart: extra.pinchStart || false,
         pinchEnd: extra.pinchEnd || false,
         doublePinch: extra.doublePinch || false,
+        // Linking-pose (two-finger edge pointer).
+        linking: extra.linking || false,
+        linkStart: extra.linkStart || false,
+        linkEnd: extra.linkEnd || false,
+        // Two-handed zoom scalar (signed inter-hand spread) or null.
+        zoom: typeof extra.zoom === 'number' ? extra.zoom : null,
         swipe: swipe || null,
         landmarks: extra.landmarks || null,
         fps: Math.round(this._fps),
@@ -440,13 +572,13 @@
       this.octx.clearRect(0, 0, this.overlay.width, this.overlay.height);
     }
 
-    _drawOverlay(lm, dist, pinch) {
+    _drawOverlay(lm, dist, pinch, linking = false) {
       const { width: W, height: H } = this.overlay;
       const ctx = this.octx;
       ctx.clearRect(0, 0, W, H);
 
       ctx.lineWidth = 2;
-      ctx.strokeStyle = pinch ? '#00ff9c' : '#00f3ff';
+      ctx.strokeStyle = linking ? '#ffd000' : pinch ? '#00ff9c' : '#00f3ff';
       ctx.beginPath();
       for (const [a, b] of HAND_CONNECTIONS) {
         const pa = lm[a], pb = lm[b];
@@ -474,7 +606,44 @@
 
       ctx.fillStyle = '#e6faff';
       ctx.font = '14px monospace';
-      ctx.fillText(`d=${dist.toFixed(3)} ${pinch ? 'PINCH' : ''}`, 8, 20);
+      const tag = linking ? 'LINK' : pinch ? 'PINCH' : '';
+      ctx.fillText(`d=${dist.toFixed(3)} ${tag}`, 8, 20);
+      ctx.fillText(`fps ${Math.round(this._fps)}`, 8, 38);
+    }
+
+    /* ---------------------------------------------------------------------
+     * Dual-hand overlay for zoom mode: draw both skeletons + the tension line
+     * between the two pinch points so the zoom gesture reads clearly.
+     * ------------------------------------------------------------------ */
+    _drawOverlayDual(hands) {
+      const { width: W, height: H } = this.overlay;
+      const ctx = this.octx;
+      ctx.clearRect(0, 0, W, H);
+
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#bd00ff';
+      ctx.beginPath();
+      for (const h of hands) {
+        for (const [a, b] of HAND_CONNECTIONS) {
+          ctx.moveTo(h[a].x * W, h[a].y * H);
+          ctx.lineTo(h[b].x * W, h[b].y * H);
+        }
+      }
+      ctx.stroke();
+
+      // Tension line between the two pinch centroids.
+      const ca = this._pinchPoint(hands[0]);
+      const cb = this._pinchPoint(hands[1]);
+      ctx.strokeStyle = '#00ff9c';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(ca.x * W, ca.y * H);
+      ctx.lineTo(cb.x * W, cb.y * H);
+      ctx.stroke();
+
+      ctx.fillStyle = '#e6faff';
+      ctx.font = '14px monospace';
+      ctx.fillText('ZOOM', 8, 20);
       ctx.fillText(`fps ${Math.round(this._fps)}`, 8, 38);
     }
   }

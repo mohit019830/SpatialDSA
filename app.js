@@ -93,23 +93,38 @@
   /* =========================================================================
    * Interaction state machine (driven by vision events)
    * -------------------------------------------------------------------------
-   * Standard-viewport gesture grammar (three distinct execution paths):
+   * Ultron-orb gesture grammar — three interaction layers plus node authoring:
    *
-   *   1. DOUBLE-PINCH in empty space  → create a node (single pinch never does).
-   *   2. SINGLE PINCH on a node mesh  → PATH A: lock + drag that node's XYZ.
-   *   3. SINGLE PINCH in empty space  → PATH B: lock the camera; hand delta
-   *      pans the whole field (lerp-smoothed inside render3d).
+   *   ZOOM   Two hands, both pinched. Spread apart → dolly in, together → out.
+   *          Highest priority; owns the frame while active (vision emits .zoom).
+   *
+   *   ROTATE One hand pinched over EMPTY space. Hand deltas spin the field
+   *          (yaw = rotation.y, pitch = rotation.x) with momentum.
+   *   DRAG   One hand pinched over a NODE. That node follows the fingertip.
+   *
+   *   LINK   Two-finger pointer (index+middle extended, ring+pinky curled)
+   *          starting on Node A. A glowing temp line follows the fingertip;
+   *          curling the middle finger over Node B commits the edge, over empty
+   *          space discards it.
+   *
+   *   CREATE Double-pinch in empty space spawns a node (unchanged).
    * ====================================================================== */
-  // Interaction modes.
-  const MODE = { IDLE: 'IDLE', DRAG_NODE: 'DRAG_NODE', CAMERA: 'CAMERA' };
+  const MODE = {
+    IDLE: 'IDLE',
+    DRAG_NODE: 'DRAG_NODE',
+    ROTATE: 'ROTATE',
+    ZOOM: 'ZOOM',
+    LINK: 'LINK',
+  };
 
   // Ghost-node guard: never spawn within this of an existing node.
-  const SPAWN_MIN_GAP = 1.5;   // world units
+  const SPAWN_MIN_GAP = 1.5;   // world units (field-local)
 
   const gesture = {
     mode: MODE.IDLE,
-    dragTarget: null,          // uuid of the node locked for dragging (Path A)
-    lastCursor: null,          // {x,y} last normalized cursor (for camera deltas)
+    dragTarget: null,          // uuid of the node locked for dragging
+    lastCursor: null,          // {x,y} last normalized cursor (for rotate deltas)
+    linkFrom: null,            // uuid of Node A while a link line is being drawn
   };
 
   /* =========================================================================
@@ -287,15 +302,28 @@
     // can single-pinch the fresh node afterward to reposition it.
     gesture.mode = MODE.IDLE;
     gesture.dragTarget = null;
+    gesture.linkFrom = null;
     setMode('CREATE');
   }
 
   /* -------------------------------------------------------------------------
-   * PATH: SINGLE PINCH-DOWN → contextual lock.
-   *   hovered != null → PATH A: lock the node for dragging.
-   *   hovered == null → PATH B: lock the camera for panning.
-   * The renderer already raycast through the fingertip on the pinch-down edge,
-   * so `hovered` is the authoritative mesh-intersection result.
+   * ZOOM (two-handed pinch). vision.js emits a signed `zoom` spread scalar;
+   * render3d applies the 0.1 camera-Z lerp. Zoom pre-empts every single-hand
+   * gesture, so we tear down any in-flight drag/rotate/link first.
+   * ---------------------------------------------------------------------- */
+  function onZoom(spread) {
+    if (gesture.mode === MODE.LINK) renderer.endLink();   // abort a half-drawn link
+    gesture.mode = MODE.ZOOM;
+    gesture.dragTarget = null;
+    gesture.linkFrom = null;
+    renderer.zoomCamera(spread);
+    setMode('ZOOM');
+  }
+
+  /* -------------------------------------------------------------------------
+   * SINGLE PINCH-DOWN → contextual lock.
+   *   over a node  → DRAG that node.
+   *   empty space  → ROTATE the field (Ultron orb spin).
    * ---------------------------------------------------------------------- */
   function onPinchStart(hovered, worldPoint, cursor) {
     if (hovered) {
@@ -303,10 +331,10 @@
       gesture.dragTarget = hovered;
       setMode('DRAG');
     } else {
-      gesture.mode = MODE.CAMERA;
+      gesture.mode = MODE.ROTATE;
       gesture.dragTarget = null;
       gesture.lastCursor = cursor ? { x: cursor.x, y: cursor.y } : null;
-      setMode('CAMERA');
+      setMode('ROTATE');
     }
   }
 
@@ -315,33 +343,66 @@
    * ---------------------------------------------------------------------- */
   function onPinchMove(worldPoint, cursor) {
     if (gesture.mode === MODE.DRAG_NODE) {
-      // PATH A: node follows the cursor's world position.
+      // Node follows the fingertip (field-local worldPoint from render3d).
       if (gesture.dragTarget && worldPoint) {
         engine.moveNode(gesture.dragTarget, worldPoint);
       }
-    } else if (gesture.mode === MODE.CAMERA) {
-      // PATH B: translate hand delta into a camera pan. render3d applies the
-      // 0.1 lerp so the field glides. Deltas are normalized-screen units.
+    } else if (gesture.mode === MODE.ROTATE) {
+      // Hand delta spins the field. render3d applies the momentum lerp; deltas
+      // are normalized-screen units, so yaw follows horizontal, pitch vertical.
       if (cursor && gesture.lastCursor) {
         const dnx = cursor.x - gesture.lastCursor.x;
         const dny = cursor.y - gesture.lastCursor.y;
-        renderer.panCamera(dnx, dny);
+        renderer.rotateField(dnx, dny);
       }
       if (cursor) gesture.lastCursor = { x: cursor.x, y: cursor.y };
     }
   }
 
   /* -------------------------------------------------------------------------
-   * PINCH RELEASE → drop whatever we were holding.
+   * PINCH RELEASE → drop the pinch-driven gesture (drag / rotate).
    * ---------------------------------------------------------------------- */
   function onPinchEnd() {
-    if (gesture.mode === MODE.CAMERA) {
-      // Hand the camera back to the gentle idle auto-orbit.
-      renderer.resumeAutoOrbit();
+    if (gesture.mode === MODE.DRAG_NODE || gesture.mode === MODE.ROTATE) {
+      gesture.mode = MODE.IDLE;
+      gesture.dragTarget = null;
+      gesture.lastCursor = null;
+      setMode('IDLE');
     }
+  }
+
+  /* -------------------------------------------------------------------------
+   * LINKING POSE — two-finger pointer for edge creation.
+   *   onLinkStart : pose entered over Node A → anchor a glowing temp line.
+   *   onLinkMove  : fingertip drags the free end of the line.
+   *   onLinkEnd   : pose exited → commit edge if over Node B, else discard.
+   * ---------------------------------------------------------------------- */
+  function onLinkStart(hovered) {
+    // Only meaningful if the pose begins on a node.
+    if (!hovered) return;
+    if (renderer.beginLink(hovered)) {
+      gesture.mode = MODE.LINK;
+      gesture.linkFrom = hovered;
+      gesture.dragTarget = null;
+      setMode('LINK');
+    }
+  }
+
+  function onLinkMove(worldPoint) {
+    if (gesture.mode !== MODE.LINK) return;
+    renderer.updateLink(worldPoint);   // field-local endpoint follows fingertip
+  }
+
+  function onLinkEnd(hovered) {
+    if (gesture.mode !== MODE.LINK) return;
+    const from = gesture.linkFrom;
+    // Commit only if we released over a DIFFERENT node.
+    if (from && hovered && hovered !== from) {
+      engine.addEdge(from, hovered, { directed: true, weight: 1 });
+    }
+    renderer.endLink();                // solidified via setModel, or discarded
     gesture.mode = MODE.IDLE;
-    gesture.dragTarget = null;
-    gesture.lastCursor = null;
+    gesture.linkFrom = null;
     setMode('IDLE');
   }
 
@@ -362,38 +423,77 @@
 
     if (!renderer) return;
 
-    // Update the mid-air cursor + (gated) raycast hover. Passing evt.pinch lets
-    // the renderer restrict expensive raycasts to active-pinch movement.
+    /* ---- LAYER 1: TWO-HANDED ZOOM (highest priority) --------------------
+     * When both hands are pinched, vision emits a signed `zoom` spread and no
+     * cursor. This owns the frame — we route it and return before any
+     * single-hand raycast/gesture logic runs. */
+    if (evt.zoom !== null && evt.zoom !== undefined) {
+      renderer.updateCursor(0, 0, false, false);
+      onZoom(evt.zoom);
+      return;
+    }
+    // Falling out of zoom (second hand dropped) hands control back to idle.
+    if (gesture.mode === MODE.ZOOM) onPinchEnd_zoomExit();
+
+    // Update the mid-air cursor + (gated) raycast hover. `forceHover` is on
+    // during the linking pose so we resolve node targets WITHOUT a pinch.
     let hovered = null, worldPoint = null;
     if (evt.present && evt.cursor) {
-      const res = renderer.updateCursor(evt.cursor.x, evt.cursor.y, true, evt.pinch);
+      // forceHover on the linking pose AND on its release edge, so the final
+      // "commit over Node B?" raycast is fresh rather than a frame stale.
+      const res = renderer.updateCursor(
+        evt.cursor.x, evt.cursor.y, true, evt.pinch, evt.linking || evt.linkEnd
+      );
       hovered = res.hovered;
       worldPoint = res.worldPoint;
     } else {
       renderer.updateCursor(0, 0, false, false);
-      // Lost the hand mid-gesture: release any lock so nothing sticks.
-      if (!evt.present && gesture.mode !== MODE.IDLE) onPinchEnd();
+      // Lost the hand mid-gesture: tear down whatever was in flight.
+      if (!evt.present && gesture.mode !== MODE.IDLE) {
+        if (gesture.mode === MODE.LINK) onLinkEnd(null);
+        else onPinchEnd();
+      }
     }
 
-    // Pinch edge events fire ONLY on real detection frames (vision.js never
-    // emits them on interpolated frames), so the state machine stays stable.
-    //
-    // Dispatch order matters: a double-pinch also carries a pinchStart edge on
-    // its second down, so we handle the double-pinch (node create) FIRST and
-    // return, ensuring a single pinch alone can never spawn a node.
-    if (evt.doublePinch) {
-      onDoublePinch(hovered, worldPoint);
-    } else if (evt.pinchStart) {
-      onPinchStart(hovered, worldPoint, evt.cursor);
-    } else if (evt.pinch) {
-      onPinchMove(worldPoint, evt.cursor);
-    } else if (evt.pinchEnd) {
-      onPinchEnd();
+    /* ---- LAYER 3: LINKING POSE (two-finger edge pointer) ----------------
+     * Handled before pinch so the two grammars never collide. Edge events
+     * (linkStart/linkEnd) fire only on real detection frames; linkMove rides
+     * every frame so the temp line tracks the interpolated fingertip. */
+    if (evt.linkStart) {
+      onLinkStart(hovered);
+    } else if (evt.linkEnd) {
+      onLinkEnd(hovered);
+    } else if (gesture.mode === MODE.LINK && evt.linking) {
+      onLinkMove(worldPoint);
+    }
+
+    /* ---- LAYER 2: SINGLE-HAND PINCH (rotate / drag / create) ------------
+     * Skipped entirely while a link is being drawn. Dispatch order matters: a
+     * double-pinch also carries a pinchStart edge on its second down, so we
+     * handle double-pinch (create) FIRST — a single pinch can never spawn. */
+    if (gesture.mode !== MODE.LINK && !evt.linking) {
+      if (evt.doublePinch) {
+        onDoublePinch(hovered, worldPoint);
+      } else if (evt.pinchStart) {
+        onPinchStart(hovered, worldPoint, evt.cursor);
+      } else if (evt.pinch) {
+        onPinchMove(worldPoint, evt.cursor);
+      } else if (evt.pinchEnd) {
+        onPinchEnd();
+      }
     }
 
     // Swipes map straight onto trace stepping.
     if (evt.swipe === 'SWIPE_RIGHT') stepForward();
     else if (evt.swipe === 'SWIPE_LEFT') stepBackward();
+  }
+
+  /** Zoom released (dropped to one/zero hands): return to idle cleanly. */
+  function onPinchEnd_zoomExit() {
+    gesture.mode = MODE.IDLE;
+    gesture.dragTarget = null;
+    gesture.lastCursor = null;
+    setMode('IDLE');
   }
 
   /* =========================================================================

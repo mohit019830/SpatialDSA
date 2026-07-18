@@ -189,12 +189,20 @@
       point.position.set(0, 12, 20);
       this.scene.add(point);
 
+      // --- Rotatable field container -------------------------------------
+      // Nodes, edges, and the grid live INSIDE this group so one-handed pinch
+      // rotation spins the whole data structure (Ultron-orb style) while the
+      // lights, cursor reticle, and HUD stay fixed in world space. At identity
+      // rotation this is transparent — world space == field space.
+      this.field = new THREE.Group();
+      this.scene.add(this.field);
+
       // --- Ground grid for spatial reference ------------------------------
       this.grid = new THREE.GridHelper(120, 60, 0x00f3ff, 0x14313a);
       this.grid.position.y = -10;
       this.grid.material.opacity = 0.25;
       this.grid.material.transparent = true;
-      this.scene.add(this.grid);
+      this.field.add(this.grid);
 
       // --- Registries: uuid -> mesh/group --------------------------------
       this.nodeMeshes = new Map();
@@ -226,14 +234,42 @@
       this.autoRotate = true;
       this._clock = new THREE.Clock();
 
-      // --- Camera pan controller -----------------------------------------
-      // When the user pinches empty space and drags, app.js calls panCamera()
-      // to push a target camera position. The frame loop lerps the live camera
-      // toward this target (CAM_LERP) so the whole field slides smoothly rather
-      // than snapping. Seeded from the initial camera placement.
+      // --- Camera / field motion controllers -----------------------------
+      // ZOOM: app.js pushes a target camera-Z via zoomCamera(); the frame loop
+      // lerps camera.position toward it (CAM_LERP = 0.1) for buttery dolly.
       this._camTarget = this.camera.position.clone();
-      this.CAM_LERP = 0.1;          // coordinate-smoothing factor
+      this.CAM_LERP = 0.1;          // coordinate-smoothing factor (spec: 0.1)
       this.CAM_PAN_LIMIT = 60;      // clamp so the field can't be flung off-screen
+      this.ZOOM_MIN = 12;           // closest dolly (world units on Z)
+      this.ZOOM_MAX = 80;           // farthest dolly
+
+      // ROTATE: one-handed pinch accumulates a rotation target for `field`;
+      // the frame loop eases the live rotation toward it (ROT_LERP) so the orb
+      // spins with momentum instead of snapping.
+      this._rotTarget = new THREE.Euler(0, 0, 0, 'YXZ');
+      this.ROT_GAIN = 6.0;          // hand-delta (0..1 screen) → radians
+      this.ROT_LERP = 0.12;         // rotation-smoothing factor (momentum feel)
+
+      // TEMP LINK LINE: one reusable 2-vertex glowing line for the edge pointer.
+      const linkGeo = new THREE.BufferGeometry();
+      linkGeo.setAttribute(
+        'position',
+        new THREE.BufferAttribute(new Float32Array(6), 3)
+      );
+      this._linkLine = new THREE.Line(
+        linkGeo,
+        new THREE.LineBasicMaterial({
+          color: 0x00ff9c,
+          transparent: true,
+          opacity: 0.9,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        })
+      );
+      this._linkLine.visible = false;
+      this._linkLine.frustumCulled = false;   // endpoints move every frame
+      this._linkFrom = null;
+      this.field.add(this._linkLine);          // lives in field space
 
       // --- Reusable temporaries (avoid per-frame allocations) ------------
       this._tmpVec3 = new THREE.Vector3();
@@ -390,7 +426,7 @@
         if (!group) {
           group = this._createNodeMesh(node);
           this.nodeMeshes.set(node.uuid, group);
-          this.scene.add(group);
+          this.field.add(group);
         }
         // Update label only if the value changed (BST delete copies values).
         if (group.userData.labelValue !== node.value) {
@@ -411,7 +447,7 @@
       for (const [uuid, group] of this.nodeMeshes) {
         if (!seenNodes.has(uuid)) {
           this._disposeGroup(group);
-          this.scene.remove(group);
+          this.field.remove(group);
           this.nodeMeshes.delete(uuid);
         }
       }
@@ -424,11 +460,11 @@
         if (!group || group.userData.directed !== edge.directed) {
           if (group) {
             this._disposeGroup(group);
-            this.scene.remove(group);
+            this.field.remove(group);
           }
           group = this._createEdgeMesh(edge);
           this.edgeMeshes.set(edge.uuid, group);
-          this.scene.add(group);
+          this.field.add(group);
         }
         group.userData.from = edge.from;
         group.userData.to = edge.to;
@@ -438,7 +474,7 @@
       for (const [uuid, group] of this.edgeMeshes) {
         if (!seenEdges.has(uuid)) {
           this._disposeGroup(group);
-          this.scene.remove(group);
+          this.field.remove(group);
           this.edgeMeshes.delete(uuid);
         }
       }
@@ -513,7 +549,7 @@
      * (already un-mirrored by the caller). Returns hovered node uuid (or null)
      * and a world point on the work plane.
      * ------------------------------------------------------------------ */
-    updateCursor(nx, ny, visible, pinch = false) {
+    updateCursor(nx, ny, visible, pinch = false, forceHover = false) {
       this._cursorActive = !!visible;
       this.cursor.visible = !!visible;
       if (!visible) {
@@ -543,8 +579,11 @@
       const pinchChanged = pinch !== this._lastPinch;
       const moved = dx > this.RAYCAST_DELTA || dy > this.RAYCAST_DELTA;
       const pinchDown = pinchChanged && pinch;
+      // `forceHover` lets the linking pose (two-finger pointer — NOT a pinch)
+      // resolve node targets while the user isn't pinching.
+      const wantCast = pinch || forceHover;
 
-      if ((moved && pinch) || pinchDown) {
+      if ((moved && wantCast) || pinchDown || (forceHover && !this._lastHovered)) {
         this._lastRayNx = nx;
         this._lastRayNy = ny;
         this._lastHovered = this._hoverTest(worldPoint);
@@ -554,7 +593,7 @@
         ring.material = this._lastHovered
           ? SHARED.cursorRingHoverMat
           : SHARED.cursorRingMat;
-      } else if (!pinch && this._lastHovered) {
+      } else if (!wantCast && this._lastHovered) {
         // Released: drop the hover highlight without paying for a raycast.
         this._lastHovered = null;
         this.cursor.userData.ring.material = SHARED.cursorRingMat;
@@ -564,37 +603,85 @@
       // we don't raycast.
       this._lastPinch = pinch;
 
+      // The cursor reticle floats at the WORLD point (fixed HUD space). But
+      // nodes live inside `field`, which may be rotated — so the point handed
+      // back for placement/drag/linking must be converted to FIELD-LOCAL space.
+      // worldToLocal mutates in place, hence the clone.
+      const localPoint = this.field.worldToLocal(worldPoint.clone());
+
       return {
         hovered: this._lastHovered,
-        worldPoint: worldPoint.clone(),
+        worldPoint: localPoint,
       };
-    }
-
-    /* ---------------------------------------------------------------------
-     * Camera pan (Path B). `dnx, dny` are the frame-to-frame hand deltas in
-     * normalized screen space; we translate them into a camera-position target
-     * that the frame loop lerps toward (see CAM_LERP). Panning disables the
-     * idle auto-orbit so the two don't fight over the camera.
-     * ------------------------------------------------------------------ */
-    panCamera(dnx, dny) {
-      this.autoRotate = false;
-
-      // Scale normalized deltas to world units. Horizontal hand motion slides
-      // the field on X; vertical motion slides it on Y (inverted so dragging
-      // up moves the camera up, i.e. the scene appears to move down).
-      const SCALE = 60;
-      this._camTarget.x -= dnx * SCALE;
-      this._camTarget.y += dny * SCALE;
-
-      // Clamp so the structure can't be lost off-screen.
-      const L = this.CAM_PAN_LIMIT;
-      this._camTarget.x = Math.max(-L, Math.min(L, this._camTarget.x));
-      this._camTarget.y = Math.max(-L, Math.min(L, this._camTarget.y));
     }
 
     /** Re-arm the gentle idle auto-orbit (called when interaction ends). */
     resumeAutoOrbit() {
       this.autoRotate = true;
+    }
+
+    /* ---------------------------------------------------------------------
+     * ONE-HANDED PINCH → ROTATE FIELD (Ultron replica). `dnx, dny` are the
+     * frame-to-frame hand deltas in normalized screen space. We accumulate
+     * them into a rotation TARGET; the frame loop eases the live field toward
+     * it (ROT_LERP) so the structure spins with weight/momentum. Horizontal
+     * hand motion → yaw (rotation.y); vertical → pitch (rotation.x).
+     * ------------------------------------------------------------------ */
+    rotateField(dnx, dny) {
+      this.autoRotate = false;
+      this._rotTarget.y += dnx * this.ROT_GAIN;
+      this._rotTarget.x += dny * this.ROT_GAIN;
+      // Clamp pitch so the field can't tumble fully upside-down.
+      const P = Math.PI / 2;
+      this._rotTarget.x = Math.max(-P, Math.min(P, this._rotTarget.x));
+    }
+
+    /* ---------------------------------------------------------------------
+     * TWO-HANDED PINCH → ZOOM (Ultron replica). `spread` is the signed change
+     * in inter-hand distance from vision.js (>0 spreading → zoom IN). We map it
+     * to a camera-Z TARGET; the frame loop lerps camera.position.z toward it
+     * (CAM_LERP = 0.1) for buttery zoom. Smaller Z = closer = zoomed in.
+     * ------------------------------------------------------------------ */
+    zoomCamera(spread) {
+      this.autoRotate = false;
+      const ZOOM_GAIN = 60;                 // world units per unit of hand spread
+      this._camTarget.z -= spread * ZOOM_GAIN;
+      // Clamp to a sane dolly range so you can't fly through or lose the scene.
+      this._camTarget.z = Math.max(this.ZOOM_MIN, Math.min(this.ZOOM_MAX, this._camTarget.z));
+    }
+
+    /* ---------------------------------------------------------------------
+     * TEMP LINK LINE (two-finger edge pointer). A single reusable glowing Line
+     * lives inside `field`; we just move its two vertices and toggle visibility
+     * — never allocate per gesture. beginLink anchors vertex 0 at a node,
+     * updateLink drags vertex 1 to the field-local cursor, endLink hides it.
+     * ------------------------------------------------------------------ */
+    beginLink(fromUuid) {
+      const group = this.nodeMeshes.get(fromUuid);
+      if (!group) return false;
+      this._linkFrom = fromUuid;
+      const pos = this._linkLine.geometry.attributes.position;
+      // Vertex 0 = source node position (field-local).
+      pos.setXYZ(0, group.position.x, group.position.y, group.position.z);
+      pos.setXYZ(1, group.position.x, group.position.y, group.position.z);
+      pos.needsUpdate = true;
+      this._linkLine.visible = true;
+      return true;
+    }
+
+    updateLink(localPoint) {
+      if (!this._linkLine.visible || !localPoint) return;
+      const group = this.nodeMeshes.get(this._linkFrom);
+      const pos = this._linkLine.geometry.attributes.position;
+      // Re-anchor vertex 0 each frame in case the source node is still lerping.
+      if (group) pos.setXYZ(0, group.position.x, group.position.y, group.position.z);
+      pos.setXYZ(1, localPoint.x, localPoint.y, localPoint.z);
+      pos.needsUpdate = true;
+    }
+
+    endLink() {
+      this._linkLine.visible = false;
+      this._linkFrom = null;
     }
 
     /* ---------------------------------------------------------------------
@@ -604,31 +691,33 @@
      * first reject nodes whose bounding box the ray misses (a few multiplies
      * per node), and only run intersectObjects on the tiny surviving set.
      * ------------------------------------------------------------------ */
-    _hoverTest(worldPoint) {
+    _hoverTest(_worldPoint) {
       const ray = this.raycaster.ray;
       const candidates = [];
 
+      // The ray is in WORLD space; node groups sit inside `field`, so their
+      // .position is FIELD-LOCAL. We broad-phase against each node's WORLD
+      // position (getWorldPosition into a shared temp — no allocation) so the
+      // filter stays correct even when the field is rotated. We use only the
+      // ray↔point distance test, which is rotation-independent, and skip the
+      // old z=0 plane-proximity shortcut (invalid once the field tilts).
+      const wp = this._tmpVec3;
       for (const group of this.nodeMeshes.values()) {
         const sphere = group.userData.sphere;
         if (!sphere) continue;
-        const p = group.position;
+        group.getWorldPosition(wp);
         const half = group.userData.aabbHalf || NODE_RADIUS;
 
-        // (1) Broad phase A: on the z=0 work plane the cursor lives at
-        //     worldPoint; if the node is nowhere near it, skip immediately.
-        const pdx = p.x - worldPoint.x;
-        const pdy = p.y - worldPoint.y;
-        if (pdx * pdx + pdy * pdy > (half * 2.5) * (half * 2.5)) continue;
-
-        // (2) Broad phase B: AABB — does the ray pass within the node's box?
-        //     distanceSqToPoint is a handful of ops vs full triangle casting.
-        if (ray.distanceSqToPoint(p) <= half * half) {
+        // Broad phase: does the ray pass within the node's bounding radius?
+        // distanceSqToPoint is a handful of ops vs full triangle casting.
+        if (ray.distanceSqToPoint(wp) <= half * half) {
           candidates.push(sphere);
         }
       }
 
       if (candidates.length === 0) return null;
       // Narrow phase: only the survivors get a precise intersection test.
+      // intersectObjects respects world matrices, so rotation is handled.
       const hits = this.raycaster.intersectObjects(candidates, false);
       return hits.length ? hits[0].object.userData.uuid : null;
     }
@@ -697,21 +786,29 @@
         this.cursor.scale.setScalar(pulse);
       }
 
-      // Camera: either the gentle idle auto-orbit, or a user-driven pan that
-      // lerps toward the target set by panCamera().
+      // --- Camera + field motion -----------------------------------------
       if (this.autoRotate && !this._cursorActive) {
+        // Idle showcase orbit. Keep the interaction targets synced to the live
+        // transforms so grabbing rotate/zoom later never snaps.
         const r = 34;
         this.camera.position.x = Math.sin(t * 0.08) * r;
         this.camera.position.z = Math.cos(t * 0.08) * r;
         this.camera.position.y = 6 + Math.sin(t * 0.15) * 2;
         this.camera.lookAt(0, 0, 0);
-        // Keep the pan target synced so grabbing the camera later doesn't jump.
         this._camTarget.copy(this.camera.position);
+        this._rotTarget.x = this.field.rotation.x;
+        this._rotTarget.y = this.field.rotation.y;
       } else if (!this.autoRotate) {
-        // Data hysteresis: ease the live camera toward the pan target (0.1),
-        // so the field glides rather than snapping frame-to-frame.
+        // ZOOM: ease camera toward the dolly target (0.1 lerp), keep it aimed
+        // at origin. X/Y stay put — zoom is pure Z dolly.
         this.camera.position.lerp(this._camTarget, this.CAM_LERP);
         this.camera.lookAt(0, 0, 0);
+
+        // ROTATE: ease the field toward its rotation target for momentum.
+        this.field.rotation.x +=
+          (this._rotTarget.x - this.field.rotation.x) * this.ROT_LERP;
+        this.field.rotation.y +=
+          (this._rotTarget.y - this.field.rotation.y) * this.ROT_LERP;
       }
 
       this.renderer.render(this.scene, this.camera);
