@@ -241,6 +241,29 @@
       if (stream) stream.getTracks().forEach((t) => t.stop());
     }
 
+    /**
+     * Toggle the whole vision pipeline. `on=false` stops the rAF loop AND the
+     * camera stream (the webcam light goes out — true privacy off). `on=true`
+     * re-acquires the camera if its tracks were killed, then restarts the loop.
+     * The MediaPipe landmarker itself is kept warm across toggles (it's the
+     * expensive thing to build), so re-enabling is fast. Returns a promise so
+     * callers can await the camera handshake and surface permission failures.
+     */
+    async setEnabled(on) {
+      if (on) {
+        const stream = this.video.srcObject;
+        const alive = !!stream && stream.getTracks &&
+          stream.getTracks().some((t) => t.readyState === 'live');
+        if (!alive) await this._startCamera();  // re-request if tracks are dead
+        this.start();
+      } else {
+        this.stop();
+        // Wipe any frozen hand skeleton off the overlay.
+        this.octx.clearRect(0, 0, this.overlay.width, this.overlay.height);
+        this.onStatus('idle', 'Gestures off — camera stopped.');
+      }
+    }
+
     _loop() {
       if (!this.running) return;
       try {

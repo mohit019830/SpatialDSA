@@ -72,6 +72,8 @@
     btnApplyMatrix: $('#btnApplyMatrix'),
     btnResetMatrix: $('#btnResetMatrix'),
     linalgPresets: $('#linalgPresets'),
+    // global input
+    btnGestureToggle: $('#btnGestureToggle'),
     // hud
     hudMode: $('#hudMode'),
     hudPinch: $('#hudPinch'),
@@ -130,7 +132,16 @@
     ZOOM: 'ZOOM',
     LINK: 'LINK',
     LASER: 'LASER',            // mouse-driven "draw & shoot" edge laser
+    LA_DRAG: 'LA_DRAG',        // dragging a basis vector in linear-algebra mode
+    NAV: 'NAV',                // mouse-driven field rotate (empty-space drag)
   };
+
+  // Global input state. When gestures are OFF, the vision pipeline + webcam are
+  // stopped and the mouse drives everything. The mouse is ALWAYS live; when
+  // gestures are on, vision simply wins any frame it's actively driving.
+  let gesturesEnabled = true;
+  // True while the 3D stage is showing the linear-algebra grid transformer.
+  let linearMode = false;
 
   // Ghost-node guard: never spawn within this of an existing node.
   const SPAWN_MIN_GAP = 1.5;   // world units (field-local)
@@ -151,6 +162,10 @@
     active: false,
     from: null,                // uuid of the locked Source Node
     snapTo: null,              // uuid the laser is currently magnet-locked to
+    // Extra mouse roles (used mainly when gestures are off, but always live):
+    navFrom: null,             // {x,y} client px anchor for empty-space rotate
+    laDrag: false,             // dragging an LA basis vector with the mouse
+    downAt: null,              // {x,y,t} of the last mousedown (click vs drag)
   };
 
   /* =========================================================================
@@ -389,7 +404,8 @@
    * PINCH RELEASE → drop the pinch-driven gesture (drag / rotate).
    * ---------------------------------------------------------------------- */
   function onPinchEnd() {
-    if (gesture.mode === MODE.DRAG_NODE || gesture.mode === MODE.ROTATE) {
+    if (gesture.mode === MODE.DRAG_NODE || gesture.mode === MODE.ROTATE ||
+        gesture.mode === MODE.LA_DRAG) {
       gesture.mode = MODE.IDLE;
       gesture.dragTarget = null;
       gesture.lastCursor = null;
@@ -481,6 +497,17 @@
       }
     }
 
+    /* ---- LINEAR-ALGEBRA MODE owns the pinch grammar ---------------------
+     * In grid-transform mode the data-structure gestures (link / create /
+     * node-drag) are meaningless. A pinch instead grabs the nearest basis-
+     * vector tip and drags it (reshaping the matrix live); an empty-space
+     * pinch still rotates the grid. Handle it and return before the DS layers.
+     * Two-handed zoom already returned above, so camera dolly still works. */
+    if (linearMode) {
+      handleLinearGesture(evt, worldPoint);
+      return;
+    }
+
     /* ---- LAYER 3: LINKING POSE (two-finger edge pointer) ----------------
      * Handled before pinch so the two grammars never collide. Edge events
      * (linkStart/linkEnd) fire only on real detection frames; linkMove rides
@@ -520,6 +547,58 @@
     gesture.dragTarget = null;
     gesture.lastCursor = null;
     setMode('IDLE');
+  }
+
+  /* -------------------------------------------------------------------------
+   * LINEAR-ALGEBRA PINCH GRAMMAR.
+   *   pinch near î/ĵ tip → grab + drag that basis vector (reshapes matrix).
+   *   pinch in open space → rotate the grid (reuses the field rotate path).
+   *   release            → settle the matrix into the form + det badge.
+   * Hover (no pinch) highlights the grabbable arrow under the cursor.
+   * ---------------------------------------------------------------------- */
+  function handleLinearGesture(evt, worldPoint) {
+    // Hand gone: release any in-flight grab, drop rotate.
+    if (!evt.present || !evt.cursor) {
+      if (renderer.laIsGrabbing) syncMatrixFromRenderer(renderer.laReleaseBasis());
+      if (gesture.mode === MODE.ROTATE || gesture.mode === MODE.LA_DRAG) onPinchEnd();
+      renderer.laHighlightBasis(null);
+      return;
+    }
+
+    if (evt.pinchStart) {
+      // Prefer grabbing a basis tip; fall back to rotating the grid.
+      const pick = renderer.laBasisPick(worldPoint);
+      if (pick !== null && renderer.laGrabBasis(pick)) {
+        gesture.mode = MODE.LA_DRAG;
+        setMode('LA_DRAG');
+      } else {
+        gesture.mode = MODE.ROTATE;
+        gesture.lastCursor = evt.cursor ? { x: evt.cursor.x, y: evt.cursor.y } : null;
+        setMode('ROTATE');
+      }
+    } else if (evt.pinch) {
+      if (gesture.mode === MODE.LA_DRAG) {
+        syncMatrixFromRenderer(renderer.laDragBasisTo(worldPoint));
+      } else if (gesture.mode === MODE.ROTATE && evt.cursor && gesture.lastCursor) {
+        const dnx = evt.cursor.x - gesture.lastCursor.x;
+        const dny = evt.cursor.y - gesture.lastCursor.y;
+        renderer.rotateField(dnx, dny);
+        gesture.lastCursor = { x: evt.cursor.x, y: evt.cursor.y };
+      }
+    } else if (evt.pinchEnd) {
+      if (gesture.mode === MODE.LA_DRAG) syncMatrixFromRenderer(renderer.laReleaseBasis());
+      onPinchEnd();
+    } else {
+      // Idle hand: just highlight the arrow the cursor is near.
+      renderer.laHighlightBasis(renderer.laBasisPick(worldPoint));
+    }
+  }
+
+  /** Push a renderer-produced matrix (drag result) back into the form + badge. */
+  function syncMatrixFromRenderer(m) {
+    if (!m) return;
+    writeMatrixCells(m);
+    updateDetBadge(m);
   }
 
   /* =========================================================================
@@ -660,6 +739,55 @@
       const on = speech.toggle();
       els.voiceToggle.textContent = on ? 'disable' : 'enable';
     });
+
+    els.btnGestureToggle.addEventListener('click', () => setGesturesEnabled(!gesturesEnabled));
+  }
+
+  /* -------------------------------------------------------------------------
+   * GLOBAL HAND-GESTURE TOGGLE.
+   * OFF → stop the vision pipeline AND the webcam stream (camera light off);
+   *       the mouse (always live) becomes the sole input.
+   * ON  → re-acquire the camera + restart detection.
+   * The mouse works either way; this only controls the camera/vision half.
+   * ---------------------------------------------------------------------- */
+  async function setGesturesEnabled(on) {
+    gesturesEnabled = on;
+    els.btnGestureToggle.classList.toggle('is-on', on);
+    els.btnGestureToggle.setAttribute('aria-pressed', String(on));
+    els.btnGestureToggle.textContent = on ? 'GESTURES · ON' : 'GESTURES · OFF';
+
+    // Turning off mid-gesture must tear down anything vision had in flight.
+    if (!on) {
+      if (gesture.mode !== MODE.IDLE) {
+        if (gesture.mode === MODE.LINK) onLinkEnd(null);
+        else if (renderer && renderer.laIsGrabbing) renderer.laReleaseBasis();
+        onPinchEnd();
+        onPinchEnd_zoomExit();
+      }
+      // The rAF loop is about to stop, so hide the now-frozen mid-air reticle.
+      if (renderer) renderer.updateCursor(0, 0, false, false);
+    }
+
+    if (!vision) {
+      // No vision engine at all (camera never initialized) — mouse-only anyway.
+      els.hudDesc.textContent = on
+        ? 'Camera unavailable — mouse controls remain active.'
+        : 'Gestures off. Use the mouse to build and explore.';
+      return;
+    }
+    try {
+      await vision.setEnabled(on);
+    } catch (err) {
+      console.warn('[app] gesture toggle failed:', err);
+      // Camera re-request denied: fall back to mouse and reflect reality.
+      gesturesEnabled = false;
+      els.btnGestureToggle.classList.remove('is-on');
+      els.btnGestureToggle.setAttribute('aria-pressed', 'false');
+      els.btnGestureToggle.textContent = 'GESTURES · OFF';
+    }
+    els.hudDesc.textContent = on
+      ? 'Gestures on. Pinch to grab; two hands to zoom.'
+      : 'Gestures off. Mouse: drag empty space to orbit, click to spawn, wheel to zoom.';
   }
 
   /* =========================================================================
@@ -674,10 +802,26 @@
    * the mouse path stays inert so the two inputs never fight over the beam.
    * ====================================================================== */
   function visionOwnsFrame() {
+    // A live vision gesture only pre-empts the mouse while gestures are ON.
+    if (!gesturesEnabled) return false;
     return gesture.mode === MODE.DRAG_NODE ||
            gesture.mode === MODE.ROTATE ||
            gesture.mode === MODE.ZOOM ||
-           gesture.mode === MODE.LINK;
+           gesture.mode === MODE.LINK ||
+           gesture.mode === MODE.LA_DRAG;
+  }
+
+  /** Reset every transient mouse role. Called on release, blur, and toggles. */
+  function resetMouse() {
+    if (mouse.active) renderer.endLink();
+    if (mouse.laDrag) { renderer.laReleaseBasis(); renderer.laHighlightBasis(null); }
+    mouse.active = false;
+    mouse.from = null;
+    mouse.snapTo = null;
+    mouse.navFrom = null;
+    mouse.laDrag = false;
+    mouse.downAt = null;
+    setMode(linearMode ? 'LINEAR' : 'IDLE');
   }
 
   function wireMouse() {
@@ -687,62 +831,125 @@
       if (e.button !== 0) return;              // left button only
       if (!renderer || visionOwnsFrame()) return;
 
-      const { hovered } = renderer.raycastScreen(e.clientX, e.clientY);
-      if (!hovered) return;                    // must start ON a node
+      mouse.downAt = { x: e.clientX, y: e.clientY, t: performance.now() };
 
-      if (renderer.beginLink(hovered)) {
+      /* ---- LINEAR-ALGEBRA MODE: grab a basis tip, else rotate the grid ---- */
+      if (linearMode) {
+        const { worldPoint } = renderer.raycastScreen(e.clientX, e.clientY);
+        const pick = renderer.laBasisPick(worldPoint);
+        if (pick !== null && renderer.laGrabBasis(pick)) {
+          mouse.laDrag = true;
+          setMode('LA_DRAG');
+        } else {
+          mouse.navFrom = { x: e.clientX, y: e.clientY };
+          setMode('NAV');
+        }
+        return;
+      }
+
+      /* ---- DATA-STRUCTURE MODE: on a node → laser link; else → rotate ----- */
+      const { hovered } = renderer.raycastScreen(e.clientX, e.clientY);
+      if (hovered && renderer.beginLink(hovered)) {
         mouse.active = true;
         mouse.from = hovered;
         mouse.snapTo = null;
         setMode('LASER');
+      } else {
+        // Empty space → orbit the field (was gesture-only before).
+        mouse.navFrom = { x: e.clientX, y: e.clientY };
+        setMode('NAV');
       }
     });
 
     canvas.addEventListener('mousemove', (e) => {
-      if (!mouse.active || !renderer) return;
+      if (!renderer) return;
 
-      const { worldPoint } = renderer.raycastScreen(e.clientX, e.clientY);
-      if (!worldPoint) return;
+      // Hover highlight for LA basis tips even before grabbing.
+      if (linearMode && !mouse.laDrag && !mouse.navFrom) {
+        const { worldPoint } = renderer.raycastScreen(e.clientX, e.clientY);
+        renderer.laHighlightBasis(renderer.laBasisPick(worldPoint));
+      }
 
-      // Auto-aim: is the tip inside a node's magnet radius?
-      const target = renderer.magnetTarget(mouse.from, worldPoint);
-      if (target) {
-        mouse.snapTo = target;
-        renderer.snapLinkTo(target);           // pin + locked-green glow
-      } else {
-        mouse.snapTo = null;
-        renderer.updateLink(worldPoint);       // free-flying aiming beam
+      if (mouse.laDrag) {
+        const { worldPoint } = renderer.raycastScreen(e.clientX, e.clientY);
+        syncMatrixFromRenderer(renderer.laDragBasisTo(worldPoint));
+        return;
+      }
+
+      if (mouse.navFrom) {
+        // Pixel delta → normalized-screen delta (matches rotateField's units).
+        const rect = canvas.getBoundingClientRect();
+        const dnx = (e.clientX - mouse.navFrom.x) / rect.width;
+        const dny = (e.clientY - mouse.navFrom.y) / rect.height;
+        renderer.rotateField(dnx, dny);
+        mouse.navFrom = { x: e.clientX, y: e.clientY };
+        return;
+      }
+
+      if (mouse.active) {
+        const { worldPoint } = renderer.raycastScreen(e.clientX, e.clientY);
+        if (!worldPoint) return;
+        // Auto-aim: is the tip inside a node's magnet radius?
+        const target = renderer.magnetTarget(mouse.from, worldPoint);
+        if (target) {
+          mouse.snapTo = target;
+          renderer.snapLinkTo(target);         // pin + locked-green glow
+        } else {
+          mouse.snapTo = null;
+          renderer.updateLink(worldPoint);     // free-flying aiming beam
+        }
       }
     });
 
     // Commit (or discard) on release. Listen on window so a mouseup that lands
-    // outside the canvas still resolves the beam.
+    // outside the canvas still resolves the interaction.
     window.addEventListener('mouseup', (e) => {
-      if (!mouse.active) return;
       if (e.button !== 0) return;
 
-      if (mouse.snapTo && mouse.snapTo !== mouse.from) {
-        // Magnetically locked onto Node B → permanently commit the edge.
-        engine.addEdge(mouse.from, mouse.snapTo, { directed: true, weight: 1 });
+      if (mouse.laDrag) {
+        syncMatrixFromRenderer(renderer.laReleaseBasis());
+        resetMouse();
+        return;
       }
-      // Whether committed (solidified via setModel) or released in open air,
-      // tear the temporary beam down.
-      renderer.endLink();
-      mouse.active = false;
-      mouse.from = null;
-      mouse.snapTo = null;
-      setMode('IDLE');
+
+      if (mouse.navFrom) {
+        // A click that barely moved in empty space = spawn a node (DS mode only).
+        const moved = mouse.downAt &&
+          Math.hypot(e.clientX - mouse.downAt.x, e.clientY - mouse.downAt.y) > 5;
+        if (!linearMode && !moved) {
+          const { hovered, worldPoint } = renderer.raycastScreen(e.clientX, e.clientY);
+          if (!hovered && worldPoint && !closestNode(worldPoint, SPAWN_MIN_GAP)) {
+            engine.addNode(nextValue(), worldPoint);
+            setMode('CREATE');
+          }
+        }
+        resetMouse();
+        return;
+      }
+
+      if (mouse.active) {
+        if (mouse.snapTo && mouse.snapTo !== mouse.from) {
+          // Magnetically locked onto Node B → permanently commit the edge.
+          engine.addEdge(mouse.from, mouse.snapTo, { directed: true, weight: 1 });
+        }
+        resetMouse();
+      }
     });
 
-    // Losing the window (alt-tab, drag-off) should never leave a beam stuck on.
+    // Losing the window (alt-tab, drag-off) should never leave state stuck on.
     window.addEventListener('blur', () => {
-      if (!mouse.active) return;
-      renderer.endLink();
-      mouse.active = false;
-      mouse.from = null;
-      mouse.snapTo = null;
-      setMode('IDLE');
+      if (mouse.active || mouse.navFrom || mouse.laDrag) resetMouse();
     });
+
+    // Scroll-wheel dolly zoom (works regardless of gesture state). rotateField/
+    // zoomCamera share the same lerp targets the two-handed pinch drives.
+    canvas.addEventListener('wheel', (e) => {
+      if (!renderer) return;
+      e.preventDefault();
+      // Wheel-up (negative deltaY) = zoom in. Map to the same signed "spread"
+      // scalar the pinch zoom uses; small magnitude for a gentle dolly.
+      renderer.zoomCamera(-e.deltaY * 0.0015);
+    }, { passive: false });
   }
 
   /* =========================================================================
@@ -844,11 +1051,13 @@
     return m;
   }
 
-  /** Write a column-major float array back into the nine cells. */
+  /** Write a column-major array back into the cells (rounded for legibility). */
   function writeMatrixCells(m) {
     els.matrixGrid.querySelectorAll('.mx-cell').forEach((cell) => {
       const idx = parseInt(cell.getAttribute('data-mx'), 10);
-      cell.value = String(m[idx]);
+      // Trim floating drift from live drags; keep clean integers integer-looking.
+      const v = Math.round(m[idx] * 100) / 100;
+      cell.value = String(v);
     });
   }
 
@@ -878,6 +1087,7 @@
 
       const on = btn.getAttribute('data-lamode') === 'on';
       els.linalgBody.classList.toggle('hidden', !on);
+      linearMode = on;
       if (on) {
         stopExecute();
         renderer.enterLinearMode();
@@ -885,6 +1095,8 @@
         renderer.applyMatrix(m);
         updateDetBadge(m);
         setMode('LINEAR');
+        els.hudDesc.textContent =
+          'Grab î (green) or ĵ (red) and drag to reshape the matrix. Pinch/mouse both work.';
       } else {
         renderer.exitLinearMode();
         renderer.resumeAutoOrbit();
@@ -1019,9 +1231,14 @@
       vision.start();
     } catch (err) {
       console.error('[app] vision init failed:', err);
-      // The lab still works with manual buttons + (maybe) voice.
+      // The lab still works with the mouse + manual buttons + (maybe) voice.
+      vision = null;
+      gesturesEnabled = false;
+      els.btnGestureToggle.classList.remove('is-on');
+      els.btnGestureToggle.setAttribute('aria-pressed', 'false');
+      els.btnGestureToggle.textContent = 'GESTURES · OFF';
       els.hudDesc.textContent =
-        'Camera unavailable — use the manual controls and voice commands.';
+        'Camera unavailable — use the mouse, manual buttons, and voice commands.';
     }
 
     // Reveal the lab. Offer an explicit enter button (also unlocks audio/mic

@@ -78,6 +78,12 @@ html, body {
 }
 .badge-accent { color: var(--cyan); border-color: rgba(0,243,255,.4); box-shadow: 0 0 12px rgba(0,243,255,.15) inset; }
 
+/* Global hand-gesture toggle in the top bar. Green when on, dim when off. */
+.badge-toggle { cursor: pointer; transition: color .15s, border-color .15s, box-shadow .15s; }
+.badge-toggle:hover { border-color: var(--green); }
+.badge-toggle.is-on { color: var(--green); border-color: rgba(0,255,156,.4); box-shadow: 0 0 12px rgba(0,255,156,.15) inset; }
+.badge-toggle:not(.is-on) { color: var(--text-dim); border-color: var(--line); }
+
 /* ============================= DASHBOARD =============================== */
 .dashboard {
   display: grid;

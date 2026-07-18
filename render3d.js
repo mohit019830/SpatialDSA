@@ -925,6 +925,11 @@
       this._laDisplayed = IDENTITY3.slice();
       this.LA_LERP_TIME = 2.0;       // seconds for a matrix transition (spec: 2s)
       this._laActive = false;
+      this._laGrabbed = null;        // index of basis vector being dragged, or null
+      this._laHi = null;             // index of currently highlighted basis arrow
+      // Only î (0) and ĵ (1) are grabbable — k̂ points out of the z=0 drag
+      // plane, so an in-plane cursor can't meaningfully reposition it.
+      this.LA_GRAB_RADIUS = 0.9;     // field-local pick radius around a basis tip
 
       // Seed geometry + arrows at identity.
       this._laApplyDisplayed(IDENTITY3.slice());
@@ -1061,6 +1066,90 @@
       const cur = this._laDisplayed;
       for (let i = 0; i < 9; i++) cur[i] = from[i] + (to[i] - from[i]) * e;
       this._laApplyDisplayed(cur);
+    }
+
+    /* ---------------------------------------------------------------------
+     * DIRECT MANIPULATION — grab a basis-vector tip and drag it (3B1B-style).
+     * Both hand-pinch and mouse route through these. Points are FIELD-LOCAL
+     * (same space updateCursor/raycastScreen already return), matching the
+     * basis tips which live at the columns of the displayed matrix.
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Return the index (0=î, 1=ĵ) of the nearest grabbable basis tip within
+     * LA_GRAB_RADIUS of `localPoint`, or null. Used for hover + grab arming.
+     */
+    laBasisPick(localPoint) {
+      if (!this._laActive || !localPoint) return null;
+      const m = this._laDisplayed;
+      let best = null;
+      let bestD2 = this.LA_GRAB_RADIUS * this.LA_GRAB_RADIUS;
+      for (let i = 0; i < 2; i++) {
+        const tx = m[i * 3], ty = m[i * 3 + 1], tz = m[i * 3 + 2];
+        const dx = tx - localPoint.x;
+        const dy = ty - localPoint.y;
+        const dz = tz - localPoint.z;
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 <= bestD2) { bestD2 = d2; best = i; }
+      }
+      return best;
+    }
+
+    /** Highlight (or clear) the basis arrow the cursor is hovering/holding. */
+    laHighlightBasis(index) {
+      if (this._laHi === index) return;
+      this._laHi = index;
+      const HI = [0x6effe0, 0xff7da0, 0xd98cff];   // brightened î/ĵ/k̂ tints
+      const BASE = [0x00ff9c, 0xff3860, 0xbd00ff];
+      for (let i = 0; i < 3; i++) {
+        this._laBasis[i].setColor(i === index ? HI[i] : BASE[i]);
+      }
+    }
+
+    /** Begin dragging basis vector `index`. Freezes any running tween. */
+    laGrabBasis(index) {
+      if (index === null || index === undefined) return false;
+      this._laGrabbed = index;
+      // Settle the tween onto the current displayed matrix so the drag starts
+      // exactly where the arrow visually is (no snap).
+      this._laFrom = this._laDisplayed.slice();
+      this._laTo = this._laDisplayed.slice();
+      this._laT = 1;
+      this.laHighlightBasis(index);
+      return true;
+    }
+
+    /**
+     * Drag the grabbed basis tip to `localPoint`, rewriting that column of the
+     * matrix and refreshing the grid immediately (no animation). Returns the
+     * updated column-major matrix so the UI form can mirror it, or null.
+     */
+    laDragBasisTo(localPoint) {
+      const i = this._laGrabbed;
+      if (i === null || i === undefined || !localPoint) return null;
+      const m = this._laDisplayed;
+      m[i * 3] = localPoint.x;
+      m[i * 3 + 1] = localPoint.y;
+      m[i * 3 + 2] = 0;                  // keep the drag in the z=0 grid plane
+      // Keep from/to pinned to the live matrix so no tween fights the drag.
+      this._laFrom = m.slice();
+      this._laTo = m.slice();
+      this._laApplyDisplayed(m);
+      return m.slice();
+    }
+
+    /** Release the grabbed basis vector. Returns the final matrix, or null. */
+    laReleaseBasis() {
+      if (this._laGrabbed === null || this._laGrabbed === undefined) return null;
+      const m = this._laDisplayed.slice();
+      this._laGrabbed = null;
+      this.laHighlightBasis(null);
+      return m;
+    }
+
+    /** Is a basis vector currently being dragged? */
+    get laIsGrabbing() {
+      return this._laGrabbed !== null && this._laGrabbed !== undefined;
     }
 
     /* ---------------------------------------------------------------------
