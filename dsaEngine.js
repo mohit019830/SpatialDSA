@@ -333,6 +333,333 @@ class DSAEngine {
   }
 
   /* --------------------------------------------------------------------- */
+  /* Text-based structural input + auto-layout                             */
+  /* ---------------------------------------------------------------------
+   * Accept raw interview test-case strings, parse them into a {nodes, edges}
+   * model, and compute clean spatial coordinates:
+   *   • Binary trees  → fixed depth/column grid   (deterministic, tidy).
+   *   • Graphs        → force-directed relaxation  (symmetric spread).
+   * Everything funnels through addNode/addEdge so emit + render + trace all
+   * behave exactly as they do for hand-built structures.
+   * ------------------------------------------------------------------ */
+
+  /** Grid spacing for binary-tree layout (world/field-local units). */
+  static get TREE_X_SPACING() { return 3.2; }
+  static get TREE_Y_SPACING() { return 4.5; }
+
+  /**
+   * Public entry point. Clears the universe and rebuilds it from `text` in the
+   * given `format` ('tree' | 'graph'). Returns { ok, error, counts } so the UI
+   * can surface parse failures inline without throwing.
+   */
+  loadFromText(format, text) {
+    let parsed;
+    try {
+      if (format === 'tree') {
+        parsed = this._parseTreeArray(text);
+      } else if (format === 'graph') {
+        parsed = this._parseEdgeList(text);
+      } else {
+        return { ok: false, error: `Unknown format "${format}".` };
+      }
+    } catch (err) {
+      return { ok: false, error: err.message || String(err) };
+    }
+
+    if (!parsed || parsed.nodes.length === 0) {
+      return { ok: false, error: 'No nodes found in input.' };
+    }
+
+    // Commit: wipe and rebuild the live model in one shot, emitting once.
+    this.model = { nodes: parsed.nodes, edges: parsed.edges };
+    this._resetTrace();
+    this._emit();
+    return {
+      ok: true,
+      counts: { nodes: parsed.nodes.length, edges: parsed.edges.length },
+    };
+  }
+
+  /**
+   * Parse LeetCode level-order binary-tree notation, e.g.
+   *   [3, 9, 20, null, null, 15, 7]
+   * Nulls are holes (no node, and their children are skipped). Coordinates use
+   * a fixed binary-depth grid so the tree reads top-down and never overlaps:
+   *   depth d      → y = -d * TREE_Y_SPACING
+   *   column-in-row→ x spread symmetrically around 0, scaled by 2^(maxDepth-d)
+   *     so deeper rows fan out and parent/child columns stay aligned.
+   * Parent→child directed edges are created for present children.
+   */
+  _parseTreeArray(text) {
+    const tokens = this._tokenizeArray(text); // array of numbers / null
+    if (tokens.length === 0) return { nodes: [], edges: [] };
+
+    // First pass: assign each array index that is non-null a tree slot. We use
+    // the classic implicit-heap indexing on the *dense* array (including nulls)
+    // so children of index i are 2i+1 and 2i+2 — matching LeetCode semantics.
+    const nodeByIndex = new Map(); // arrayIndex -> node object
+    const depthOf = new Map();     // arrayIndex -> depth
+    let maxDepth = 0;
+
+    // Depth of implicit-heap index i is floor(log2(i+1)).
+    const heapDepth = (i) => Math.floor(Math.log2(i + 1));
+
+    for (let i = 0; i < tokens.length; i++) {
+      if (tokens[i] === null) continue;
+      const d = heapDepth(i);
+      depthOf.set(i, d);
+      if (d > maxDepth) maxDepth = d;
+    }
+
+    // Second pass: position + create nodes. Within a row, order present nodes
+    // by their heap "column" (i - (2^d - 1)) across the full row width so
+    // siblings stay under the right side of their parent.
+    const nodes = [];
+    for (let i = 0; i < tokens.length; i++) {
+      if (tokens[i] === null) continue;
+      const d = depthOf.get(i);
+      const firstIndexOfRow = Math.pow(2, d) - 1;   // 0,1,3,7,...
+      const colInRow = i - firstIndexOfRow;         // 0..(2^d - 1)
+      const rowCount = Math.pow(2, d);
+      // Center the row around x=0. Fan-out factor keeps deep rows wide enough
+      // that leaves never collide: total row width scales with the widest row.
+      const slotWidth = DSAEngine.TREE_X_SPACING * Math.pow(2, maxDepth - d);
+      const x = (colInRow - (rowCount - 1) / 2) * slotWidth;
+      const y = -d * DSAEngine.TREE_Y_SPACING;
+
+      const node = {
+        uuid: generateUUID(),
+        value: tokens[i],
+        position: { x, y, z: 0 },
+        state: 'default',
+      };
+      nodeByIndex.set(i, node);
+      nodes.push(node);
+    }
+
+    // Edges: connect each present node to its present children (2i+1, 2i+2).
+    const edges = [];
+    for (const [i, parent] of nodeByIndex) {
+      for (const childIdx of [2 * i + 1, 2 * i + 2]) {
+        const child = nodeByIndex.get(childIdx);
+        if (child) {
+          edges.push({
+            uuid: generateUUID(),
+            from: parent.uuid,
+            to: child.uuid,
+            directed: true,
+            weight: 1,
+            state: 'default',
+          });
+        }
+      }
+    }
+
+    return { nodes, edges };
+  }
+
+  /**
+   * Parse an edge list such as [[0,1],[1,2],[2,0]] (optionally weighted:
+   * [[0,1,5],...]). Vertex ids are arbitrary but are de-duplicated into nodes
+   * carrying their original id as `value`. Positions are seeded on a circle
+   * then relaxed by a force-directed pass for symmetric spatial distribution.
+   */
+  _parseEdgeList(text) {
+    const pairs = this._tokenizeEdgeList(text); // array of [a,b] or [a,b,w]
+    if (pairs.length === 0) return { nodes: [], edges: [] };
+
+    // Collect vertices in first-seen order for stable layout seeding.
+    const nodeById = new Map();
+    const order = [];
+    const ensure = (id) => {
+      const key = String(id);
+      if (!nodeById.has(key)) {
+        const node = {
+          uuid: generateUUID(),
+          value: id,
+          position: { x: 0, y: 0, z: 0 },
+          state: 'default',
+        };
+        nodeById.set(key, node);
+        order.push(node);
+      }
+      return nodeById.get(key);
+    };
+
+    const edges = [];
+    const seen = new Set();
+    for (const p of pairs) {
+      const a = ensure(p[0]);
+      const b = ensure(p[1]);
+      if (a === b) continue;                       // drop self-loops
+      // De-dup undirected duplicates (a-b == b-a).
+      const k1 = `${a.uuid}|${b.uuid}`;
+      const k2 = `${b.uuid}|${a.uuid}`;
+      if (seen.has(k1) || seen.has(k2)) continue;
+      seen.add(k1);
+      edges.push({
+        uuid: generateUUID(),
+        from: a.uuid,
+        to: b.uuid,
+        directed: true,
+        weight: p.length > 2 && Number.isFinite(p[2]) ? p[2] : 1,
+        state: 'default',
+      });
+    }
+
+    // Seed on a circle so the force layout starts spread out (never all at 0,0,
+    // which would make repulsion directions degenerate).
+    const n = order.length;
+    const seedR = Math.max(6, n * 1.4);
+    order.forEach((node, i) => {
+      const ang = (i / n) * Math.PI * 2;
+      node.position.x = Math.cos(ang) * seedR;
+      node.position.y = Math.sin(ang) * seedR;
+      node.position.z = 0;
+    });
+
+    this._forceLayout(order, edges);
+    return { nodes: order, edges };
+  }
+
+  /**
+   * Lightweight Fruchterman-Reingold force-directed layout. Runs a bounded,
+   * synchronous relaxation (small graphs only — interview cases), so it never
+   * blocks meaningfully. Repulsion between every pair + spring attraction
+   * along edges + gentle centering. Mutates node.position in place (z kept
+   * shallow for readability of the 2.5D field).
+   */
+  _forceLayout(nodes, edges, iterations = 140) {
+    const n = nodes.length;
+    if (n <= 1) return;
+
+    // Index nodes for O(1) edge endpoint lookup.
+    const idx = new Map();
+    nodes.forEach((node, i) => idx.set(node.uuid, i));
+
+    const AREA = Math.max(1, n) * 60;           // target spread area
+    const k = Math.sqrt(AREA / n);              // ideal edge length
+    const disp = nodes.map(() => ({ x: 0, y: 0 }));
+    let temp = k * 2.2;                          // cooling schedule start
+    const cool = temp / (iterations + 1);
+
+    for (let it = 0; it < iterations; it++) {
+      for (let i = 0; i < n; i++) { disp[i].x = 0; disp[i].y = 0; }
+
+      // Repulsion: every pair pushes apart (~ k^2 / distance).
+      for (let i = 0; i < n; i++) {
+        const pi = nodes[i].position;
+        for (let j = i + 1; j < n; j++) {
+          const pj = nodes[j].position;
+          let dx = pi.x - pj.x;
+          let dy = pi.y - pj.y;
+          let dist = Math.hypot(dx, dy) || 0.01;
+          if (dist < 0.01) { dx = (Math.random() - 0.5) * 0.1; dy = (Math.random() - 0.5) * 0.1; dist = 0.01; }
+          const force = (k * k) / dist;
+          const ux = dx / dist, uy = dy / dist;
+          disp[i].x += ux * force; disp[i].y += uy * force;
+          disp[j].x -= ux * force; disp[j].y -= uy * force;
+        }
+      }
+
+      // Attraction: edges pull endpoints together (~ dist^2 / k).
+      for (const e of edges) {
+        const a = idx.get(e.from), b = idx.get(e.to);
+        if (a === undefined || b === undefined) continue;
+        const pa = nodes[a].position, pb = nodes[b].position;
+        const dx = pa.x - pb.x, dy = pa.y - pb.y;
+        const dist = Math.hypot(dx, dy) || 0.01;
+        const force = (dist * dist) / k;
+        const ux = dx / dist, uy = dy / dist;
+        disp[a].x -= ux * force; disp[a].y -= uy * force;
+        disp[b].x += ux * force; disp[b].y += uy * force;
+      }
+
+      // Apply displacement clamped by the current temperature, then cool.
+      for (let i = 0; i < n; i++) {
+        const d = disp[i];
+        const dl = Math.hypot(d.x, d.y) || 0.01;
+        const p = nodes[i].position;
+        p.x += (d.x / dl) * Math.min(dl, temp);
+        p.y += (d.y / dl) * Math.min(dl, temp);
+        // Mild centering pull so the whole layout stays near the origin.
+        p.x -= p.x * 0.008;
+        p.y -= p.y * 0.008;
+      }
+      temp = Math.max(temp - cool, k * 0.05);
+    }
+
+    // Final recenter on the centroid so the graph sits symmetric about origin.
+    let cx = 0, cy = 0;
+    for (const node of nodes) { cx += node.position.x; cy += node.position.y; }
+    cx /= n; cy /= n;
+    for (const node of nodes) { node.position.x -= cx; node.position.y -= cy; node.position.z = 0; }
+  }
+
+  /* ---- Tokenizers (tolerant of whitespace / trailing commas) ---------- */
+
+  /**
+   * Tokenize a flat array literal like "[3, 9, 20, null, null, 15, 7]" into
+   * [3, 9, 20, null, null, 15, 7]. Accepts integers, floats, and null (also
+   * the words "null"/"#"/"-" as hole markers). Throws on malformed content.
+   */
+  _tokenizeArray(text) {
+    const inner = this._stripBrackets(text);
+    if (inner.trim() === '') return [];
+    return inner.split(',').map((raw) => {
+      const t = raw.trim();
+      if (t === '' ) return null;                 // "[1,,2]" → treat as hole
+      if (t === 'null' || t === '#' || t === '-' || t === 'None') return null;
+      const num = Number(t);
+      if (!Number.isFinite(num)) {
+        throw new Error(`Invalid tree value: "${t}"`);
+      }
+      return num;
+    });
+  }
+
+  /**
+   * Tokenize an edge list "[[0,1],[1,2],[2,0]]" into [[0,1],[1,2],[2,0]].
+   * Also accepts newline / space separated pairs like "0 1\n1 2". Weighted
+   * triples [a,b,w] are preserved. Throws on malformed content.
+   */
+  _tokenizeEdgeList(text) {
+    const trimmed = (text || '').trim();
+    if (trimmed === '') return [];
+
+    // Path A: bracketed JSON-ish nested arrays. Extract each [...] group.
+    if (trimmed.includes('[')) {
+      const groups = trimmed.match(/\[[^\[\]]*\]/g);
+      if (!groups) throw new Error('Could not find any [a,b] pairs.');
+      // Skip a leading outer wrapper match if it captured the whole thing empty.
+      return groups
+        .map((g) => this._stripBrackets(g)
+          .split(',')
+          .map((s) => Number(s.trim()))
+          .filter((v) => Number.isFinite(v)))
+        .filter((arr) => arr.length >= 2);
+    }
+
+    // Path B: whitespace / line separated pairs.
+    return trimmed.split(/\n|;/).map((line) => {
+      const parts = line.trim().split(/[\s,]+/).map(Number).filter(Number.isFinite);
+      return parts;
+    }).filter((arr) => arr.length >= 2);
+  }
+
+  /** Strip one layer of surrounding [ ] (and any outer whitespace). */
+  _stripBrackets(text) {
+    const t = (text || '').trim();
+    const start = t.indexOf('[');
+    const end = t.lastIndexOf(']');
+    if (start === -1 || end === -1 || end <= start) {
+      // No brackets at all — treat the whole thing as the inner CSV.
+      return t;
+    }
+    return t.slice(start + 1, end);
+  }
+
+  /* --------------------------------------------------------------------- */
   /* Trace lifecycle                                                        */
   /* --------------------------------------------------------------------- */
 

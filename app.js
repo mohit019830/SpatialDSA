@@ -58,6 +58,12 @@
     seedValue: $('#seedValue'),
     btnSeedNode: $('#btnSeedNode'),
     btnSeedDemo: $('#btnSeedDemo'),
+    // structure input (text auto-layout)
+    structFormatTabs: $('#structFormatTabs'),
+    structInput: $('#structInput'),
+    structStatus: $('#structStatus'),
+    btnParseStruct: $('#btnParseStruct'),
+    btnStructExample: $('#btnStructExample'),
     // hud
     hudMode: $('#hudMode'),
     hudPinch: $('#hudPinch'),
@@ -732,6 +738,74 @@
   }
 
   /* =========================================================================
+   * TEXT-BASED STRUCTURAL INPUT → AUTO-LAYOUT
+   * -------------------------------------------------------------------------
+   * Paste a raw interview test case (tree array or edge list); the engine
+   * parses + lays it out and emits, which flows through the normal
+   * onChange → setModel path. We also switch the active algorithm to something
+   * sensible for the shape so "Build Trace" just works afterward.
+   * ====================================================================== */
+  const STRUCT_EXAMPLES = {
+    tree: '[3, 9, 20, null, null, 15, 7]',
+    graph: '[[0,1],[1,2],[2,0],[1,3],[3,4],[2,4]]',
+  };
+  // The format the structure panel is currently set to.
+  let structFormat = 'tree';
+
+  function setStructStatus(msg, isError) {
+    els.structStatus.textContent = msg;
+    els.structStatus.classList.toggle('is-error', !!isError);
+  }
+
+  function wireStructureInput() {
+    // Format tab switching (Binary Tree ↔ Graph / Edges).
+    els.structFormatTabs.addEventListener('click', (e) => {
+      const btn = e.target.closest('.tab');
+      if (!btn) return;
+      els.structFormatTabs.querySelectorAll('.tab')
+        .forEach((t) => t.classList.remove('active'));
+      btn.classList.add('active');
+      structFormat = btn.getAttribute('data-format');
+      els.structInput.placeholder = STRUCT_EXAMPLES[structFormat];
+      setStructStatus(structFormat === 'tree'
+        ? 'level-order array, nulls allowed'
+        : 'edge list e.g. [[0,1],[1,2]]', false);
+    });
+
+    els.btnStructExample.addEventListener('click', () => {
+      els.structInput.value = STRUCT_EXAMPLES[structFormat];
+    });
+
+    els.btnParseStruct.addEventListener('click', () => {
+      const text = els.structInput.value;
+      if (!text.trim()) { setStructStatus('input is empty', true); return; }
+
+      stopExecute();
+      const res = engine.loadFromText(structFormat, text);
+      if (!res.ok) {
+        setStructStatus(res.error || 'parse failed', true);
+        return;
+      }
+      setStructStatus(`${res.counts.nodes} nodes · ${res.counts.edges} edges`, false);
+
+      // Pick an algorithm that matches the shape so tracing is meaningful.
+      const algo = structFormat === 'tree' ? 'bstInsert' : 'dfs';
+      engine.setActiveAlgorithm(algo);
+      syncAlgoTab(algo);
+      renderCode(algo, -1);
+      els.algoBadge.textContent = ALGO_LABELS[algo] || algo;
+    });
+  }
+
+  /** Reflect the active algorithm in the C++ trace tab strip. */
+  function syncAlgoTab(algo) {
+    const tabs = els.algoTabs.querySelectorAll('.tab');
+    tabs.forEach((t) => {
+      t.classList.toggle('active', t.getAttribute('data-algo') === algo);
+    });
+  }
+
+  /* =========================================================================
    * Demo data — seeds a structure appropriate to the active algorithm.
    * ====================================================================== */
   function seedDemoData() {
@@ -778,6 +852,7 @@
   async function boot() {
     wireControls();
     wireMouse();
+    wireStructureInput();
 
     // 1. 3D engine (required). Fail loudly if THREE / Renderer3D missing.
     if (!window.Render3D) {

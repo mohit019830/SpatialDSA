@@ -103,6 +103,7 @@ html, body {
   border: 1px solid var(--line);
   border-radius: 8px;
   overflow: hidden;
+  flex-shrink: 0;   /* keep natural height so the panel scrolls instead of squashing cards */
 }
 .card-head {
   display: flex; align-items: center; justify-content: space-between;
@@ -243,6 +244,17 @@ html, body {
   font-family: var(--mono); font-size: 12px;
 }
 .seed-input:focus { outline: none; border-color: var(--cyan); }
+
+/* ---- Structure input (text auto-layout) ---- */
+.struct-input {
+  width: 100%; box-sizing: border-box; resize: vertical;
+  margin: 8px 0; padding: 8px; border-radius: 6px;
+  background: #0a0c0f; border: 1px solid var(--line); color: var(--text);
+  font-family: var(--mono); font-size: 12px; line-height: 1.5;
+}
+.struct-input:focus { outline: none; border-color: var(--cyan); }
+.struct-input::placeholder { color: #4a5a66; }
+.desc-badge.is-error { color: var(--red, #ff3860); }
 
 /* ------------------------------ RIGHT --------------------------------- */
 .panel-right { position: relative; background: #080a0d; overflow: hidden; }

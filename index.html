@@ -87,6 +87,25 @@
           <button class="btn btn-ghost" id="btnSeedDemo">Demo Data</button>
         </div>
       </section>
+
+      <!-- Text-based structural input → auto-layout -->
+      <section class="card struct-card">
+        <div class="card-head">
+          <h2>Structure Input</h2>
+          <span id="structStatus" class="desc-badge">paste a test case</span>
+        </div>
+        <nav class="tabs" id="structFormatTabs">
+          <button class="tab active" data-format="tree">Binary Tree</button>
+          <button class="tab" data-format="graph">Graph / Edges</button>
+        </nav>
+        <textarea id="structInput" class="struct-input" rows="3"
+          spellcheck="false"
+          placeholder="[3, 9, 20, null, null, 15, 7]"></textarea>
+        <div class="controls-row">
+          <button class="btn" id="btnParseStruct">Build Layout</button>
+          <button class="btn btn-ghost" id="btnStructExample">Example</button>
+        </div>
+      </section>
     </aside>
 
     <!-- ---------- RIGHT PANEL (70%) : 3D Universe ---------- -->
