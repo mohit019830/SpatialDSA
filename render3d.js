@@ -226,6 +226,15 @@
       this.autoRotate = true;
       this._clock = new THREE.Clock();
 
+      // --- Camera pan controller -----------------------------------------
+      // When the user pinches empty space and drags, app.js calls panCamera()
+      // to push a target camera position. The frame loop lerps the live camera
+      // toward this target (CAM_LERP) so the whole field slides smoothly rather
+      // than snapping. Seeded from the initial camera placement.
+      this._camTarget = this.camera.position.clone();
+      this.CAM_LERP = 0.1;          // coordinate-smoothing factor
+      this.CAM_PAN_LIMIT = 60;      // clamp so the field can't be flung off-screen
+
       // --- Reusable temporaries (avoid per-frame allocations) ------------
       this._tmpVec3 = new THREE.Vector3();
       this._tmpDir = new THREE.Vector3();
@@ -562,6 +571,33 @@
     }
 
     /* ---------------------------------------------------------------------
+     * Camera pan (Path B). `dnx, dny` are the frame-to-frame hand deltas in
+     * normalized screen space; we translate them into a camera-position target
+     * that the frame loop lerps toward (see CAM_LERP). Panning disables the
+     * idle auto-orbit so the two don't fight over the camera.
+     * ------------------------------------------------------------------ */
+    panCamera(dnx, dny) {
+      this.autoRotate = false;
+
+      // Scale normalized deltas to world units. Horizontal hand motion slides
+      // the field on X; vertical motion slides it on Y (inverted so dragging
+      // up moves the camera up, i.e. the scene appears to move down).
+      const SCALE = 60;
+      this._camTarget.x -= dnx * SCALE;
+      this._camTarget.y += dny * SCALE;
+
+      // Clamp so the structure can't be lost off-screen.
+      const L = this.CAM_PAN_LIMIT;
+      this._camTarget.x = Math.max(-L, Math.min(L, this._camTarget.x));
+      this._camTarget.y = Math.max(-L, Math.min(L, this._camTarget.y));
+    }
+
+    /** Re-arm the gentle idle auto-orbit (called when interaction ends). */
+    resumeAutoOrbit() {
+      this.autoRotate = true;
+    }
+
+    /* ---------------------------------------------------------------------
      * Hover test with a cheap AABB proximity pre-filter.
      *
      * Full mesh raycasting walks every triangle of every sphere. Instead we
@@ -661,12 +697,20 @@
         this.cursor.scale.setScalar(pulse);
       }
 
-      // Gentle auto-orbit when the user isn't actively pointing.
+      // Camera: either the gentle idle auto-orbit, or a user-driven pan that
+      // lerps toward the target set by panCamera().
       if (this.autoRotate && !this._cursorActive) {
         const r = 34;
         this.camera.position.x = Math.sin(t * 0.08) * r;
         this.camera.position.z = Math.cos(t * 0.08) * r;
         this.camera.position.y = 6 + Math.sin(t * 0.15) * 2;
+        this.camera.lookAt(0, 0, 0);
+        // Keep the pan target synced so grabbing the camera later doesn't jump.
+        this._camTarget.copy(this.camera.position);
+      } else if (!this.autoRotate) {
+        // Data hysteresis: ease the live camera toward the pan target (0.1),
+        // so the field glides rather than snapping frame-to-frame.
+        this.camera.position.lerp(this._camTarget, this.CAM_LERP);
         this.camera.lookAt(0, 0, 0);
       }
 

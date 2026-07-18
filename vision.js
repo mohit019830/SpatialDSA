@@ -54,6 +54,10 @@
   const PINCH_START = 0.025;
   const PINCH_RELEASE = 0.055;
 
+  // Double-pinch timing gate. Two discrete pinch-down edges closer together
+  // than this (ms) count as a "double pinch" — the node-creation trigger.
+  const DOUBLE_PINCH_MS = 300;
+
   // Velocity-based swipe (frame-velocity ring buffer over the index fingertip).
   // Instead of requiring a big absolute sweep, we fire on a *sharp flick*: high
   // horizontal velocity across a short travel while vertical wobble stays low.
@@ -95,6 +99,9 @@
 
       // Debounced pinch state.
       this._pinch = false;
+      // Double-pinch timing gate: time of the last pinch-DOWN edge.
+      this._lastPinchTime = 0;
+      this._pinchCount = 0;
 
       // Presence + interpolation state.
       this._present = false;
@@ -259,6 +266,7 @@
       if (!hasHand) {
         this._present = false;
         this._pinch = false;
+        this._pinchCount = 0;
         this._track.length = 0;
         this._lastReal = null;
         this._prevReal = null;
@@ -288,6 +296,22 @@
       const pinchStart = !wasPinch && this._pinch;
       const pinchEnd = wasPinch && !this._pinch;
 
+      // ---- Double-pinch timing gate -------------------------------------
+      // On each pinch-DOWN edge, compare against the previous pinch-down. Two
+      // within DOUBLE_PINCH_MS = a double pinch (node-create trigger). The flag
+      // is transient: it rides on exactly the frame of the second pinch-down.
+      let doublePinch = false;
+      if (pinchStart) {
+        const gap = now - this._lastPinchTime;
+        if (this._pinchCount > 0 && gap < DOUBLE_PINCH_MS) {
+          doublePinch = true;
+          this._pinchCount = 0;          // consume the pair
+        } else {
+          this._pinchCount = 1;          // arm; this is the first of a potential pair
+        }
+        this._lastPinchTime = now;
+      }
+
       // ---- Swipe recognizer: index-fingertip velocity ring buffer -------
       this._track.push({ x: i.x, y: i.y, t: now });
       if (this._track.length > SWIPE_BUFFER) this._track.shift();
@@ -305,6 +329,7 @@
         this._event(true, { x: i.x, y: i.y }, this._pinch, false, swipe, false, {
           pinchStart,
           pinchEnd,
+          doublePinch,
           landmarks: lm,
         })
       );
@@ -353,6 +378,7 @@
         pinch,
         pinchStart: extra.pinchStart || false,
         pinchEnd: extra.pinchEnd || false,
+        doublePinch: extra.doublePinch || false,
         swipe: swipe || null,
         landmarks: extra.landmarks || null,
         fps: Math.round(this._fps),

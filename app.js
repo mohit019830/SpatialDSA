@@ -92,24 +92,25 @@
 
   /* =========================================================================
    * Interaction state machine (driven by vision events)
+   * -------------------------------------------------------------------------
+   * Standard-viewport gesture grammar (three distinct execution paths):
+   *
+   *   1. DOUBLE-PINCH in empty space  → create a node (single pinch never does).
+   *   2. SINGLE PINCH on a node mesh  → PATH A: lock + drag that node's XYZ.
+   *   3. SINGLE PINCH in empty space  → PATH B: lock the camera; hand delta
+   *      pans the whole field (lerp-smoothed inside render3d).
    * ====================================================================== */
-  // Edge target snapping: on release, snap the pointer to the closest node
-  // within this geometric bounding radius instead of discarding the edge.
-  const CONNECT_RADIUS = 2.0;      // world units — link snap radius
-  // Ghost-node guards.
-  const SPAWN_MIN_GAP = 1.5;       // world units — no spawn within this of a node
-  const SPAWN_COOLDOWN_MS = 350;   // ms after any release during which spawns are banned
+  // Interaction modes.
+  const MODE = { IDLE: 'IDLE', DRAG_NODE: 'DRAG_NODE', CAMERA: 'CAMERA' };
+
+  // Ghost-node guard: never spawn within this of an existing node.
+  const SPAWN_MIN_GAP = 1.5;   // world units
 
   const gesture = {
-    dragTarget: null,       // uuid of node currently following the finger
-    dragOrigin: null,       // {x,y,z} where the drag started (for connect-restore)
-    sourceNode: null,       // uuid pinched first (edge source candidate)
-    spawnedThisPinch: false // did this pinch create a new node?
+    mode: MODE.IDLE,
+    dragTarget: null,          // uuid of the node locked for dragging (Path A)
+    lastCursor: null,          // {x,y} last normalized cursor (for camera deltas)
   };
-
-  // Timestamp of the last pinch release. New node generation is banned for
-  // SPAWN_COOLDOWN_MS afterward so releasing/moving the hand can't drop ghosts.
-  let lastInteractionTime = 0;
 
   /* =========================================================================
    * C++ syntax highlighting (lightweight tokenizer)
@@ -254,14 +255,12 @@
    * Gesture handling — the heart of the mid-air interaction
    * ====================================================================== */
   /**
-   * Closest node to a world point, optionally excluding one uuid, within a
-   * given radius. Returns { node, dist } or null. Used both for edge-target
-   * SNAPPING and for the ghost-node proximity guard.
+   * Closest node to a world point within a radius. Returns { node, dist } or
+   * null. Used by the ghost-node proximity guard on creation.
    */
-  function closestNode(worldPoint, excludeUuid, radius) {
+  function closestNode(worldPoint, radius) {
     let best = null, bestD = Infinity;
     for (const n of currentModel.nodes) {
-      if (excludeUuid && n.uuid === excludeUuid) continue;
       const dx = n.position.x - worldPoint.x;
       const dy = n.position.y - worldPoint.y;
       const dz = n.position.z - worldPoint.z;
@@ -271,80 +270,79 @@
     return best && bestD <= radius ? { node: best, dist: bestD } : null;
   }
 
-  function onPinchStart(hovered, worldPoint) {
+  /* -------------------------------------------------------------------------
+   * PATH: DOUBLE-PINCH → NODE CREATION.
+   * Fired only when vision.js flags a double pinch (two pinch-downs < 300ms).
+   * A single pinch NEVER reaches here, so it can never spawn a node.
+   * ---------------------------------------------------------------------- */
+  function onDoublePinch(hovered, worldPoint) {
     if (!worldPoint) return;
-    if (hovered) {
-      // Grab an existing node: it becomes both a drag target and an edge source.
-      const node = currentModel.nodes.find((n) => n.uuid === hovered);
-      gesture.dragTarget = hovered;
-      gesture.sourceNode = hovered;
-      gesture.dragOrigin = node ? { ...node.position } : { ...worldPoint };
-      gesture.spawnedThisPinch = false;
-      setMode('GRAB');
-      return;
-    }
+    // Only create in genuinely empty space: not on a node, and not stacked on
+    // top of one (ghost-node guard).
+    if (hovered) return;
+    if (closestNode(worldPoint, SPAWN_MIN_GAP)) return;
 
-    // ---- Empty space → SPAWN, guarded against ghost nodes ----------------
-    // Guard 1 (debounce): reject spawns inside the post-release cooldown, so
-    // the tail end of a drag/connect release can't drop a stray node.
-    const sinceRelease = performance.now() - lastInteractionTime;
-    if (sinceRelease < SPAWN_COOLDOWN_MS) {
-      setMode('IDLE');
-      return;
-    }
-    // Guard 2 (radius lock): reject spawns that land on top of an existing
-    // node — those are almost always a mis-detected grab, not a new node.
-    if (closestNode(worldPoint, null, SPAWN_MIN_GAP)) {
-      setMode('IDLE');
-      return;
-    }
-
-    const node = engine.addNode(nextValue(), worldPoint);
-    gesture.dragTarget = node.uuid;
-    gesture.sourceNode = null;      // spawning is not an edge gesture
-    gesture.dragOrigin = { ...worldPoint };
-    gesture.spawnedThisPinch = true;
-    setMode('SPAWN');
-  }
-
-  function onPinchMove(worldPoint) {
-    if (gesture.dragTarget && worldPoint) {
-      engine.moveNode(gesture.dragTarget, worldPoint);
-    }
-  }
-
-  function onPinchEnd(hovered, worldPoint) {
-    // Stamp the release time up front so the spawn debounce covers every exit
-    // path below (connect, plain move, or abort).
-    lastInteractionTime = performance.now();
-
-    // Connect gesture: pinched a node, released near a *different* node.
-    if (gesture.sourceNode && !gesture.spawnedThisPinch && worldPoint) {
-      // TARGET SNAPPING: prefer the raycast-hovered node, otherwise snap to the
-      // closest node mesh within CONNECT_RADIUS. Only if nothing is in range do
-      // we treat the release as "no link" and discard the edge.
-      let targetUuid = null;
-      if (hovered && hovered !== gesture.sourceNode) {
-        targetUuid = hovered;
-      } else {
-        const snap = closestNode(worldPoint, gesture.sourceNode, CONNECT_RADIUS);
-        if (snap) targetUuid = snap.node.uuid;
-      }
-
-      if (targetUuid) {
-        // Treat it as a connect, not a move: restore the source's origin…
-        if (gesture.dragOrigin) engine.moveNode(gesture.sourceNode, gesture.dragOrigin);
-        // …and draw the directed pointer, snapped to the resolved target.
-        engine.addEdge(gesture.sourceNode, targetUuid, { directed: true, weight: 1 });
-        setMode('LINK');
-      }
-    }
-
-    // Reset gesture state.
+    engine.addNode(nextValue(), worldPoint);
+    // Do NOT lock a drag here — creation is its own discrete action. The user
+    // can single-pinch the fresh node afterward to reposition it.
+    gesture.mode = MODE.IDLE;
     gesture.dragTarget = null;
-    gesture.sourceNode = null;
-    gesture.dragOrigin = null;
-    gesture.spawnedThisPinch = false;
+    setMode('CREATE');
+  }
+
+  /* -------------------------------------------------------------------------
+   * PATH: SINGLE PINCH-DOWN → contextual lock.
+   *   hovered != null → PATH A: lock the node for dragging.
+   *   hovered == null → PATH B: lock the camera for panning.
+   * The renderer already raycast through the fingertip on the pinch-down edge,
+   * so `hovered` is the authoritative mesh-intersection result.
+   * ---------------------------------------------------------------------- */
+  function onPinchStart(hovered, worldPoint, cursor) {
+    if (hovered) {
+      gesture.mode = MODE.DRAG_NODE;
+      gesture.dragTarget = hovered;
+      setMode('DRAG');
+    } else {
+      gesture.mode = MODE.CAMERA;
+      gesture.dragTarget = null;
+      gesture.lastCursor = cursor ? { x: cursor.x, y: cursor.y } : null;
+      setMode('CAMERA');
+    }
+  }
+
+  /* -------------------------------------------------------------------------
+   * SINGLE PINCH SUSTAINED → drive whichever object we locked onto.
+   * ---------------------------------------------------------------------- */
+  function onPinchMove(worldPoint, cursor) {
+    if (gesture.mode === MODE.DRAG_NODE) {
+      // PATH A: node follows the cursor's world position.
+      if (gesture.dragTarget && worldPoint) {
+        engine.moveNode(gesture.dragTarget, worldPoint);
+      }
+    } else if (gesture.mode === MODE.CAMERA) {
+      // PATH B: translate hand delta into a camera pan. render3d applies the
+      // 0.1 lerp so the field glides. Deltas are normalized-screen units.
+      if (cursor && gesture.lastCursor) {
+        const dnx = cursor.x - gesture.lastCursor.x;
+        const dny = cursor.y - gesture.lastCursor.y;
+        renderer.panCamera(dnx, dny);
+      }
+      if (cursor) gesture.lastCursor = { x: cursor.x, y: cursor.y };
+    }
+  }
+
+  /* -------------------------------------------------------------------------
+   * PINCH RELEASE → drop whatever we were holding.
+   * ---------------------------------------------------------------------- */
+  function onPinchEnd() {
+    if (gesture.mode === MODE.CAMERA) {
+      // Hand the camera back to the gentle idle auto-orbit.
+      renderer.resumeAutoOrbit();
+    }
+    gesture.mode = MODE.IDLE;
+    gesture.dragTarget = null;
+    gesture.lastCursor = null;
+    setMode('IDLE');
   }
 
   function setMode(mode) {
@@ -373,14 +371,25 @@
       worldPoint = res.worldPoint;
     } else {
       renderer.updateCursor(0, 0, false, false);
-      if (!evt.present) setMode('IDLE');
+      // Lost the hand mid-gesture: release any lock so nothing sticks.
+      if (!evt.present && gesture.mode !== MODE.IDLE) onPinchEnd();
     }
 
     // Pinch edge events fire ONLY on real detection frames (vision.js never
     // emits them on interpolated frames), so the state machine stays stable.
-    if (evt.pinchStart) onPinchStart(hovered, worldPoint);
-    else if (evt.pinch) onPinchMove(worldPoint);
-    else if (evt.pinchEnd) onPinchEnd(hovered, worldPoint);
+    //
+    // Dispatch order matters: a double-pinch also carries a pinchStart edge on
+    // its second down, so we handle the double-pinch (node create) FIRST and
+    // return, ensuring a single pinch alone can never spawn a node.
+    if (evt.doublePinch) {
+      onDoublePinch(hovered, worldPoint);
+    } else if (evt.pinchStart) {
+      onPinchStart(hovered, worldPoint, evt.cursor);
+    } else if (evt.pinch) {
+      onPinchMove(worldPoint, evt.cursor);
+    } else if (evt.pinchEnd) {
+      onPinchEnd();
+    }
 
     // Swipes map straight onto trace stepping.
     if (evt.swipe === 'SWIPE_RIGHT') stepForward();
