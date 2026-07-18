@@ -64,6 +64,14 @@
     structStatus: $('#structStatus'),
     btnParseStruct: $('#btnParseStruct'),
     btnStructExample: $('#btnStructExample'),
+    // linear algebra (grid transformer)
+    linalgModeTabs: $('#linalgModeTabs'),
+    linalgBody: $('.linalg-body'),
+    linalgDet: $('#linalgDet'),
+    matrixGrid: $('#matrixGrid'),
+    btnApplyMatrix: $('#btnApplyMatrix'),
+    btnResetMatrix: $('#btnResetMatrix'),
+    linalgPresets: $('#linalgPresets'),
     // hud
     hudMode: $('#hudMode'),
     hudPinch: $('#hudPinch'),
@@ -806,6 +814,115 @@
   }
 
   /* =========================================================================
+   * LINEAR ALGEBRA GRID TRANSFORMER (3Blue1Brown-style)
+   * -------------------------------------------------------------------------
+   * A dedicated visualization mode: the 3D stage swaps the data-structure
+   * layer for a unit grid + î/ĵ/k̂ basis arrows, and a 3x3 matrix form drives
+   * a 2-second animated transform (displayed = M(t) applied to the base grid).
+   * Matrices are read/written column-major (data-mx index == THREE.Matrix3
+   * element index) so a column of the form == where a basis vector lands.
+   * ====================================================================== */
+
+  // Presets, expressed column-major (î-col, ĵ-col, k̂-col). Z is left as the
+  // identity axis so these read as clean 2D transforms on the visible grid.
+  const LA_PRESETS = {
+    rotate90: [0, 1, 0, -1, 0, 0, 0, 0, 1],   // +90° about Z (CCW)
+    scale2:   [2, 0, 0, 0, 2, 0, 0, 0, 1],    // uniform 2× in-plane
+    shearX:   [1, 0, 0, 1, 1, 0, 0, 0, 1],    // x += y
+    reflectX: [1, 0, 0, 0, -1, 0, 0, 0, 1],   // flip across the x-axis
+    squash:   [1, 0, 0, 0.5, 0, 0, 0, 0, 1],  // collapse to a line (det 0)
+  };
+
+  /** Read the nine matrix cells into a column-major float array. */
+  function readMatrixCells() {
+    const m = new Array(9).fill(0);
+    els.matrixGrid.querySelectorAll('.mx-cell').forEach((cell) => {
+      const idx = parseInt(cell.getAttribute('data-mx'), 10);
+      const v = parseFloat(cell.value);
+      m[idx] = Number.isFinite(v) ? v : 0;
+    });
+    return m;
+  }
+
+  /** Write a column-major float array back into the nine cells. */
+  function writeMatrixCells(m) {
+    els.matrixGrid.querySelectorAll('.mx-cell').forEach((cell) => {
+      const idx = parseInt(cell.getAttribute('data-mx'), 10);
+      cell.value = String(m[idx]);
+    });
+  }
+
+  /** 3x3 determinant (column-major) — shown live; det 0 == squashed space. */
+  function det3(m) {
+    return (
+      m[0] * (m[4] * m[8] - m[5] * m[7]) -
+      m[3] * (m[1] * m[8] - m[2] * m[7]) +
+      m[6] * (m[1] * m[5] - m[2] * m[4])
+    );
+  }
+
+  function updateDetBadge(m) {
+    const d = det3(m);
+    els.linalgDet.textContent = `det ${d.toFixed(2)}`;
+    els.linalgDet.classList.toggle('is-error', Math.abs(d) < 1e-6);
+  }
+
+  function wireLinearAlgebra() {
+    // Mode toggle: Data Structure ↔ Grid Transform.
+    els.linalgModeTabs.addEventListener('click', (e) => {
+      const btn = e.target.closest('.tab');
+      if (!btn || !renderer) return;
+      els.linalgModeTabs.querySelectorAll('.tab')
+        .forEach((t) => t.classList.remove('active'));
+      btn.classList.add('active');
+
+      const on = btn.getAttribute('data-lamode') === 'on';
+      els.linalgBody.classList.toggle('hidden', !on);
+      if (on) {
+        stopExecute();
+        renderer.enterLinearMode();
+        const m = readMatrixCells();
+        renderer.applyMatrix(m);
+        updateDetBadge(m);
+        setMode('LINEAR');
+      } else {
+        renderer.exitLinearMode();
+        renderer.resumeAutoOrbit();
+        setMode('IDLE');
+      }
+    });
+
+    els.btnApplyMatrix.addEventListener('click', () => {
+      if (!renderer) return;
+      const m = readMatrixCells();
+      renderer.applyMatrix(m);
+      updateDetBadge(m);
+    });
+
+    els.btnResetMatrix.addEventListener('click', () => {
+      if (!renderer) return;
+      const I = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+      writeMatrixCells(I);
+      renderer.applyMatrix(I);
+      updateDetBadge(I);
+    });
+
+    // Live determinant readout as the user edits cells.
+    els.matrixGrid.addEventListener('input', () => updateDetBadge(readMatrixCells()));
+
+    // Presets: load the matrix into the form and animate immediately.
+    els.linalgPresets.addEventListener('click', (e) => {
+      const btn = e.target.closest('.btn-mini');
+      if (!btn || !renderer) return;
+      const preset = LA_PRESETS[btn.getAttribute('data-preset')];
+      if (!preset) return;
+      writeMatrixCells(preset);
+      renderer.applyMatrix(preset);
+      updateDetBadge(preset);
+    });
+  }
+
+  /* =========================================================================
    * Demo data — seeds a structure appropriate to the active algorithm.
    * ====================================================================== */
   function seedDemoData() {
@@ -853,6 +970,7 @@
     wireControls();
     wireMouse();
     wireStructureInput();
+    wireLinearAlgebra();
 
     // 1. 3D engine (required). Fail loudly if THREE / Renderer3D missing.
     if (!window.Render3D) {

@@ -106,6 +106,43 @@
           <button class="btn btn-ghost" id="btnStructExample">Example</button>
         </div>
       </section>
+
+      <!-- Linear algebra grid transformer (3Blue1Brown-style) -->
+      <section class="card linalg-card">
+        <div class="card-head">
+          <h2>Linear Algebra</h2>
+          <span id="linalgDet" class="desc-badge">det 1.00</span>
+        </div>
+        <nav class="tabs" id="linalgModeTabs">
+          <button class="tab active" data-lamode="off">Data Structure</button>
+          <button class="tab" data-lamode="on">Grid Transform</button>
+        </nav>
+        <div class="linalg-body hidden">
+          <p class="hint">Columns are î ĵ k̂ — where each basis vector lands.</p>
+          <div class="matrix-grid" id="matrixGrid">
+            <input class="mx-cell" data-mx="0" type="number" step="0.1" value="1" />
+            <input class="mx-cell" data-mx="3" type="number" step="0.1" value="0" />
+            <input class="mx-cell" data-mx="6" type="number" step="0.1" value="0" />
+            <input class="mx-cell" data-mx="1" type="number" step="0.1" value="0" />
+            <input class="mx-cell" data-mx="4" type="number" step="0.1" value="1" />
+            <input class="mx-cell" data-mx="7" type="number" step="0.1" value="0" />
+            <input class="mx-cell" data-mx="2" type="number" step="0.1" value="0" />
+            <input class="mx-cell" data-mx="5" type="number" step="0.1" value="0" />
+            <input class="mx-cell" data-mx="8" type="number" step="0.1" value="1" />
+          </div>
+          <div class="controls-row">
+            <button class="btn" id="btnApplyMatrix">Apply ▶</button>
+            <button class="btn btn-ghost" id="btnResetMatrix">Identity</button>
+          </div>
+          <div class="preset-row" id="linalgPresets">
+            <button class="btn-mini" data-preset="rotate90">Rotate 90°</button>
+            <button class="btn-mini" data-preset="scale2">Scale 2×</button>
+            <button class="btn-mini" data-preset="shearX">Shear X</button>
+            <button class="btn-mini" data-preset="reflectX">Reflect X</button>
+            <button class="btn-mini" data-preset="squash">Collapse</button>
+          </div>
+        </div>
+      </section>
     </aside>
 
     <!-- ---------- RIGHT PANEL (70%) : 3D Universe ---------- -->

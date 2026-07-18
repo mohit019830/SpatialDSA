@@ -55,6 +55,10 @@
   const NODE_RADIUS = 1.15;
   const LERP = 0.18; // position/scale easing per frame — smooth structural moves
 
+  // Column-major 3x3 identity (matches THREE.Matrix3.elements ordering).
+  // Used as the base state for the linear-algebra grid transformer.
+  const IDENTITY3 = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+
   /* =========================================================================
    * SHARED GEOMETRY + MATERIAL CACHE
    *
@@ -289,6 +293,9 @@
       this._tmpMid = new THREE.Vector3();
       this._tmpQuat = new THREE.Quaternion();
       this._up = new THREE.Vector3(0, 1, 0);
+
+      // --- Linear-algebra mode (3B1B-style grid transformer) -------------
+      this._buildLinearAlgebra();
 
       this._running = false;
       this._boundResize = () => this.resize();
@@ -830,6 +837,232 @@
       }
     }
 
+    /* =====================================================================
+     * LINEAR ALGEBRA MODE — 3Blue1Brown-style grid transformer
+     * ---------------------------------------------------------------------
+     * A separate scene layer that visualizes a 3x3 matrix as a spatial
+     * transform. We keep a static reference grid + a "live" grid that morphs
+     * from identity toward the applied matrix M over a timed lerp, plus three
+     * basis-vector arrows (î, ĵ, k̂) that track M's columns. All of it lives
+     * in `field` so it inherits the same pinch-rotate / zoom as the data
+     * structures. It's hidden until enterLinearMode() is called, and the DS
+     * layer (nodes/edges/grid) is hidden while it's active.
+     * ================================================================== */
+    _buildLinearAlgebra() {
+      // Container so we can toggle the whole apparatus + rotate with the field.
+      this.laGroup = new THREE.Group();
+      this.laGroup.visible = false;
+      this.field.add(this.laGroup);
+
+      // Grid extent: lines span [-N, N] on each axis, one line per unit.
+      this._laN = 6;
+      const N = this._laN;
+
+      // The base (undeformed) lattice points, stored as flat Vector3 list per
+      // line so applyMatrix can recompute deformed positions each frame without
+      // reallocating. We build two coplanar sets (XY plane) of grid lines —
+      // this reads as the classic 2D 3B1B grid while still living in 3D.
+      this._laBasePoints = [];   // Array<Vector3> — source lattice (identity)
+
+      const positions = [];
+      const pushLine = (ax, ay, bx, by) => {
+        this._laBasePoints.push(new THREE.Vector3(ax, ay, 0));
+        this._laBasePoints.push(new THREE.Vector3(bx, by, 0));
+        positions.push(0, 0, 0, 0, 0, 0); // placeholder, filled by _laWriteGeometry
+      };
+      // Vertical then horizontal grid lines.
+      for (let x = -N; x <= N; x++) pushLine(x, -N, x, N);
+      for (let y = -N; y <= N; y++) pushLine(-N, y, N, y);
+
+      // Live (morphing) grid.
+      const liveGeo = new THREE.BufferGeometry();
+      liveGeo.setAttribute(
+        'position',
+        new THREE.BufferAttribute(new Float32Array(positions), 3)
+      );
+      const liveMat = new THREE.LineBasicMaterial({
+        color: 0x00f3ff,
+        transparent: true,
+        opacity: 0.55,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      });
+      this._laLiveGrid = new THREE.LineSegments(liveGeo, liveMat);
+      this._laLiveGrid.frustumCulled = false;
+      this.laGroup.add(this._laLiveGrid);
+
+      // Static reference grid (dim, never moves) so the deformation is legible.
+      const refGeo = new THREE.BufferGeometry();
+      refGeo.setAttribute(
+        'position',
+        new THREE.BufferAttribute(new Float32Array(positions.slice()), 3)
+      );
+      const refMat = new THREE.LineBasicMaterial({
+        color: 0x1b3a44,
+        transparent: true,
+        opacity: 0.4,
+        depthWrite: false,
+      });
+      this._laRefGrid = new THREE.LineSegments(refGeo, refMat);
+      this._laRefGrid.frustumCulled = false;
+      this.laGroup.add(this._laRefGrid);
+      // Reference grid is identity forever — fill it once.
+      this._laWriteGeometry(this._laRefGrid.geometry, IDENTITY3);
+
+      // Basis-vector arrows: î (x, green), ĵ (y, red), k̂ (z, purple).
+      this._laBasis = [
+        this._makeBasisArrow(0x00ff9c), // î
+        this._makeBasisArrow(0xff3860), // ĵ
+        this._makeBasisArrow(0xbd00ff), // k̂
+      ];
+      this._laBasis.forEach((a) => this.laGroup.add(a));
+
+      // Matrix animation state. `from`/`to` are 9-element column-major arrays
+      // (matching THREE.Matrix3.elements); `t` eases 0→1 over LA_LERP_TIME.
+      this._laFrom = IDENTITY3.slice();
+      this._laTo = IDENTITY3.slice();
+      this._laT = 1;                 // 1 == settled (no animation pending)
+      this._laDisplayed = IDENTITY3.slice();
+      this.LA_LERP_TIME = 2.0;       // seconds for a matrix transition (spec: 2s)
+      this._laActive = false;
+
+      // Seed geometry + arrows at identity.
+      this._laApplyDisplayed(IDENTITY3.slice());
+    }
+
+    /** Build one basis-vector arrow (unit length along +X; oriented later). */
+    _makeBasisArrow(color) {
+      const dir = new THREE.Vector3(1, 0, 0);
+      const origin = new THREE.Vector3(0, 0, 0);
+      const arrow = new THREE.ArrowHelper(dir, origin, 1, color, 0.4, 0.24);
+      // Make the shaft a touch brighter/additive so it glows over the grid.
+      if (arrow.line && arrow.line.material) {
+        arrow.line.material.transparent = true;
+        arrow.line.material.opacity = 0.95;
+      }
+      arrow.frustumCulled = false;
+      return arrow;
+    }
+
+    /**
+     * Write deformed lattice positions into a LineSegments geometry given a
+     * column-major 3x3 matrix `m` (9 floats). Each base point p maps to M·p.
+     */
+    _laWriteGeometry(geometry, m) {
+      const attr = geometry.getAttribute('position');
+      const arr = attr.array;
+      const pts = this._laBasePoints;
+      for (let i = 0; i < pts.length; i++) {
+        const p = pts[i];
+        // Column-major: col0=(m0,m1,m2), col1=(m3,m4,m5), col2=(m6,m7,m8).
+        const x = m[0] * p.x + m[3] * p.y + m[6] * p.z;
+        const y = m[1] * p.x + m[4] * p.y + m[7] * p.z;
+        const z = m[2] * p.x + m[5] * p.y + m[8] * p.z;
+        const o = i * 3;
+        arr[o] = x; arr[o + 1] = y; arr[o + 2] = z;
+      }
+      attr.needsUpdate = true;
+    }
+
+    /** Point the three basis arrows along the columns of column-major `m`. */
+    _laUpdateBasis(m) {
+      const cols = [
+        this._tmpVec3.set(m[0], m[1], m[2]).clone(), // î
+        this._tmpVec3.set(m[3], m[4], m[5]).clone(), // ĵ
+        this._tmpVec3.set(m[6], m[7], m[8]).clone(), // k̂
+      ];
+      for (let i = 0; i < 3; i++) {
+        const v = cols[i];
+        const len = v.length();
+        if (len > 1e-6) {
+          this._laBasis[i].visible = true;
+          this._laBasis[i].setDirection(v.clone().normalize());
+          this._laBasis[i].setLength(len, Math.min(0.4, len * 0.28), Math.min(0.24, len * 0.16));
+        } else {
+          // Degenerate (collapsed) column — hide the arrow rather than NaN.
+          this._laBasis[i].visible = false;
+        }
+      }
+    }
+
+    /** Push a fully-resolved displayed matrix into geometry + arrows. */
+    _laApplyDisplayed(m) {
+      this._laDisplayed = m;
+      this._laWriteGeometry(this._laLiveGrid.geometry, m);
+      this._laUpdateBasis(m);
+    }
+
+    /**
+     * Enter linear-algebra mode: hide the data-structure layer, show the grid
+     * transformer, and reset to identity. Auto-orbit is disabled so the user
+     * can read the transform head-on (they can still pinch-rotate).
+     */
+    enterLinearMode() {
+      this._laActive = true;
+      this.laGroup.visible = true;
+      // Hide DS layer (nodes, edges, ground grid, link line) for a clean stage.
+      for (const g of this.nodeMeshes.values()) g.visible = false;
+      for (const g of this.edgeMeshes.values()) g.visible = false;
+      this.grid.visible = false;
+      this._linkLine.visible = false;
+      // Face the grid: park the camera on +Z looking at origin, stop orbiting.
+      this.autoRotate = false;
+      this._camTarget.set(0, 2, 24);
+      this.field.rotation.set(0, 0, 0);
+      this._rotTarget.set(0, 0, 0, 'YXZ');
+      this.resetMatrix(true);
+    }
+
+    /** Leave linear-algebra mode and restore the data-structure layer. */
+    exitLinearMode() {
+      this._laActive = false;
+      this.laGroup.visible = false;
+      for (const g of this.nodeMeshes.values()) g.visible = true;
+      for (const g of this.edgeMeshes.values()) g.visible = true;
+      this.grid.visible = true;
+    }
+
+    /**
+     * Animate toward a new transform. `elements` is a column-major 9-float
+     * array (THREE.Matrix3 order). The live grid + arrows lerp from whatever
+     * is currently displayed to `elements` over LA_LERP_TIME seconds.
+     */
+    applyMatrix(elements) {
+      if (!elements || elements.length !== 9) return;
+      this._laFrom = this._laDisplayed.slice();
+      this._laTo = elements.slice();
+      this._laT = 0;               // kick off the animated transition
+      this._laClockLast = this._clock.getElapsedTime();
+    }
+
+    /** Snap (or animate) back to the identity transform. */
+    resetMatrix(immediate = false) {
+      if (immediate) {
+        this._laFrom = IDENTITY3.slice();
+        this._laTo = IDENTITY3.slice();
+        this._laT = 1;
+        this._laApplyDisplayed(IDENTITY3.slice());
+      } else {
+        this.applyMatrix(IDENTITY3.slice());
+      }
+    }
+
+    /** Per-frame linear-algebra tween (called from _frame while active). */
+    _updateLinearAlgebra(t) {
+      if (!this._laActive || this._laT >= 1) return;
+      // Advance eased parameter by real elapsed delta.
+      const last = this._laClockLast === undefined ? t : this._laClockLast;
+      const dt = Math.max(0, t - last);
+      this._laClockLast = t;
+      this._laT = Math.min(1, this._laT + dt / this.LA_LERP_TIME);
+      // Smoothstep for a gentle ease-in-out.
+      const e = this._laT * this._laT * (3 - 2 * this._laT);
+      const from = this._laFrom, to = this._laTo;
+      const cur = this._laDisplayed;
+      for (let i = 0; i < 9; i++) cur[i] = from[i] + (to[i] - from[i]) * e;
+      this._laApplyDisplayed(cur);
+    }
+
     /* ---------------------------------------------------------------------
      * Animation loop.
      * ------------------------------------------------------------------ */
@@ -851,6 +1084,20 @@
 
     _frame() {
       const t = this._clock.getElapsedTime();
+
+      // Linear-algebra mode owns the stage: advance the matrix tween, ease the
+      // camera/field, and skip the (hidden) data-structure bookkeeping.
+      if (this._laActive) {
+        this._updateLinearAlgebra(t);
+        this.camera.position.lerp(this._camTarget, this.CAM_LERP);
+        this.camera.lookAt(0, 0, 0);
+        this.field.rotation.x +=
+          (this._rotTarget.x - this.field.rotation.x) * this.ROT_LERP;
+        this.field.rotation.y +=
+          (this._rotTarget.y - this.field.rotation.y) * this.ROT_LERP;
+        this.renderer.render(this.scene, this.camera);
+        return;
+      }
 
       // Lerp node transforms toward targets for smooth structural motion.
       for (const group of this.nodeMeshes.values()) {

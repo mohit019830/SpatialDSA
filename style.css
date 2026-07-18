@@ -256,6 +256,32 @@ html, body {
 .struct-input::placeholder { color: #4a5a66; }
 .desc-badge.is-error { color: var(--red, #ff3860); }
 
+/* ---- Linear algebra grid transformer ---- */
+.linalg-body { padding: 10px 12px 12px; }
+/* Collapsed when the mode is "Data Structure" — the matrix UI is irrelevant. */
+.linalg-body.hidden { display: none; }
+.matrix-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin: 8px 0 10px;
+  padding: 8px;
+  border: 1px solid var(--line); border-radius: 6px;
+  background: rgba(0,243,255,.03);
+}
+.mx-cell {
+  width: 100%; box-sizing: border-box; padding: 6px 4px;
+  text-align: center;
+  background: #0a0c0f; border: 1px solid var(--line); border-radius: 4px;
+  color: var(--text); font-family: var(--mono); font-size: 13px;
+}
+.mx-cell:focus { outline: none; border-color: var(--cyan); }
+/* Column tints so î/ĵ/k̂ read as the same colors as the 3D arrows. */
+.mx-cell[data-mx="0"], .mx-cell[data-mx="1"], .mx-cell[data-mx="2"] { color: var(--green); }
+.mx-cell[data-mx="3"], .mx-cell[data-mx="4"], .mx-cell[data-mx="5"] { color: var(--red); }
+.mx-cell[data-mx="6"], .mx-cell[data-mx="7"], .mx-cell[data-mx="8"] { color: var(--purple); }
+.preset-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+
 /* ------------------------------ RIGHT --------------------------------- */
 .panel-right { position: relative; background: #080a0d; overflow: hidden; }
 #scene { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
