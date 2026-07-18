@@ -169,22 +169,63 @@
   /* =========================================================================
    * Engine → UI binding
    * ====================================================================== */
-  engine.onChange((state) => {
-    currentModel = state.model;
+  /*
+   * DECOUPLED UI FLUSH
+   * ------------------------------------------------------------------------
+   * The engine emits on every mutation — including once per frame while a node
+   * is being dragged. Doing DOM work (re-tokenizing the whole C++ listing,
+   * innerHTML swaps, scrollIntoView) synchronously on each emit was the primary
+   * source of main-thread jank.
+   *
+   * Instead, onChange only stashes the latest state and requests a single rAF
+   * flush. Within the flush we:
+   *   • hand the model to the renderer (cheap uuid-diff reconciliation), and
+   *   • rebuild the expensive code panel ONLY when the highlighted line or the
+   *     algorithm actually changed. Pure position updates (drags) skip it.
+   */
+  let _pendingState = null;
+  let _uiFlushScheduled = false;
+  let _lastRenderedLine = -2;
+  let _lastRenderedAlgo = null;
+
+  function scheduleUIFlush() {
+    if (_uiFlushScheduled) return;
+    _uiFlushScheduled = true;
+    requestAnimationFrame(flushUI);
+  }
+
+  function flushUI() {
+    _uiFlushScheduled = false;
+    const state = _pendingState;
+    if (!state) return;
+
+    // 3D model reconciliation (allocation-free, safe every frame).
     if (renderer) renderer.setModel(state.model);
 
-    // Code panel + description.
-    renderCode(state.algorithm, state.lineIndex);
+    // Heavy code-panel rebuild: gated on line/algorithm change only.
+    if (state.lineIndex !== _lastRenderedLine || state.algorithm !== _lastRenderedAlgo) {
+      renderCode(state.algorithm, state.lineIndex);
+      _lastRenderedLine = state.lineIndex;
+      _lastRenderedAlgo = state.algorithm;
+    }
+
+    // Cheap text/badge updates.
     els.descBadge.textContent = state.playing
       ? `step ${state.stepIndex + 1}/${state.stepCount}`
       : 'idle';
     els.hudDesc.textContent = state.description || '';
-
-    // Badges.
     els.stepBadge.textContent = state.playing
       ? `STEP ${state.stepIndex + 1}/${state.stepCount}`
       : 'STEP --';
     els.algoBadge.textContent = ALGO_LABELS[state.algorithm] || state.algorithm;
+  }
+
+  engine.onChange((state) => {
+    // Keep the synchronous shared reference fresh so gesture math (which reads
+    // node positions immediately) never lags a frame behind.
+    currentModel = state.model;
+    _pendingState = state;
+    scheduleUIFlush();
   });
 
   /* =========================================================================
@@ -270,23 +311,29 @@
    * Vision wiring
    * ====================================================================== */
   function handleVisionFrame(evt) {
-    els.fpsBadge.textContent = `FPS ${evt.fps || 0}`;
-    els.hudPinch.textContent = `PINCH · ${evt.pinch ? 'yes' : 'no'}`;
+    // Cheap HUD text (only when the value actually changed, to avoid layout
+    // thrash on every interpolated frame).
+    const fpsTxt = `FPS ${evt.fps || 0}`;
+    if (els.fpsBadge.textContent !== fpsTxt) els.fpsBadge.textContent = fpsTxt;
+    const pinchTxt = `PINCH · ${evt.pinch ? 'yes' : 'no'}`;
+    if (els.hudPinch.textContent !== pinchTxt) els.hudPinch.textContent = pinchTxt;
 
     if (!renderer) return;
 
-    // Update the mid-air cursor + raycast hover.
+    // Update the mid-air cursor + (gated) raycast hover. Passing evt.pinch lets
+    // the renderer restrict expensive raycasts to active-pinch movement.
     let hovered = null, worldPoint = null;
     if (evt.present && evt.cursor) {
-      const res = renderer.updateCursor(evt.cursor.x, evt.cursor.y, true);
+      const res = renderer.updateCursor(evt.cursor.x, evt.cursor.y, true, evt.pinch);
       hovered = res.hovered;
       worldPoint = res.worldPoint;
     } else {
-      renderer.updateCursor(0, 0, false);
+      renderer.updateCursor(0, 0, false, false);
       if (!evt.present) setMode('IDLE');
     }
 
-    // Pinch edge events drive the interaction state machine.
+    // Pinch edge events fire ONLY on real detection frames (vision.js never
+    // emits them on interpolated frames), so the state machine stays stable.
     if (evt.pinchStart) onPinchStart(hovered, worldPoint);
     else if (evt.pinch) onPinchMove(worldPoint);
     else if (evt.pinchEnd) onPinchEnd(hovered, worldPoint);
@@ -309,8 +356,31 @@
     return n;
   }
 
+  /*
+   * DECOUPLED ALGORITHM TICKS
+   * ------------------------------------------------------------------------
+   * engine.buildTrace() deep-clones the entire model for every algorithm step
+   * — heavy, synchronous work. It must never run inside a rAF frame (render or
+   * vision), or it stalls the compositor and trips the unresponsive-page
+   * watchdog. `deferHeavy` bounces such work to a macrotask so the current
+   * frame finishes painting first.
+   */
+  function deferHeavy(fn) {
+    setTimeout(fn, 0);
+  }
+
+  let _buildScheduled = false;
   function stepForward() {
-    if (engine.algorithmHistory.length === 0) buildTrace();
+    if (engine.algorithmHistory.length === 0) {
+      // Build off-frame, then advance once the trace exists.
+      if (_buildScheduled) return;
+      _buildScheduled = true;
+      deferHeavy(() => {
+        _buildScheduled = false;
+        if (buildTrace()) engine.stepForward();
+      });
+      return;
+    }
     engine.stepForward();
   }
 
@@ -321,14 +391,18 @@
   let executeTimer = null;
   function execute() {
     stopExecute();
-    const steps = buildTrace();
-    if (!steps) return;
-    engine.jumpToStart();
-    // Auto-advance through the trace on a timer for a hands-free "play".
-    executeTimer = setInterval(() => {
-      const advanced = engine.stepForward();
-      if (!advanced) stopExecute();
-    }, 900);
+    // Build the (potentially large) trace off the current frame.
+    deferHeavy(() => {
+      const steps = buildTrace();
+      if (!steps) return;
+      engine.jumpToStart();
+      // Auto-advance on a timer — setInterval callbacks run between frames,
+      // never inside requestAnimationFrame, so playback can't block rendering.
+      executeTimer = setInterval(() => {
+        const advanced = engine.stepForward();
+        if (!advanced) stopExecute();
+      }, 900);
+    });
   }
   function stopExecute() {
     if (executeTimer) { clearInterval(executeTimer); executeTimer = null; }

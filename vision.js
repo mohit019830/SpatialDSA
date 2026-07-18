@@ -1,31 +1,29 @@
 /**
- * vision.js
+ * vision.js  (performance-optimized)
  * ---------------------------------------------------------------------------
  * MediaPipe Computer Vision Layer.
  *
- * Owns the webcam stream and the MediaPipe HandLandmarker. On every video
- * frame it:
- *   1. Detects up to one hand (21 3D landmarks).
- *   2. Computes a debounced PINCH state via 3D Euclidean distance between the
- *      THUMB_TIP (4) and INDEX_FINGER_TIP (8) with hysteresis.
- *   3. Runs a SWIPE recognizer over a short ring buffer of hand-center X/Y.
- *   4. Draws telemetry (landmarks + skeleton + pinch readout) to an overlay.
- *   5. Emits a normalized event object through the `onFrame` callback.
+ * PERFORMANCE MODEL
+ *   The MediaPipe HandLandmarker runs a WASM inference pass that is *by far*
+ *   the most expensive thing on the main thread. Running it on every rAF tick
+ *   starves Three.js and trips the "Page Unresponsive" watchdog. So we split
+ *   the loop into two cadences:
  *
- * Everything downstream (render3d, app) consumes only the normalized event:
+ *     • DETECTION cadence  — run detectForVideo() only once every
+ *       DETECT_EVERY rAF frames (default 3 → ~20 Hz on a 60 Hz display).
+ *     • INTERPOLATION cadence — on the skipped frames we do NOT touch the
+ *       model. We extrapolate the fingertip from its last measured velocity so
+ *       the 3D cursor keeps gliding smoothly instead of stalling.
  *
+ *   The webcam is also hard-capped to a 640x480 @ 30fps profile so the browser
+ *   never negotiates an expensive HD stream.
+ *
+ * The normalized event contract (unchanged, so app.js keeps working):
  *   {
- *     present:  boolean,               // is a hand visible this frame
- *     cursor:   { x, y } | null,       // index tip, 0..1, ALREADY MIRRORED
- *     pinch:    boolean,               // debounced pinch state
- *     pinchStart / pinchEnd: boolean,  // edge events (true for one frame)
- *     swipe:    'SWIPE_LEFT'|'SWIPE_RIGHT'|null,
- *     landmarks: Array|null,           // raw 21 landmarks (mirrored x)
- *     fps:      number,
+ *     present, cursor:{x,y}|null, pinch, pinchStart, pinchEnd,
+ *     swipe:'SWIPE_LEFT'|'SWIPE_RIGHT'|null, landmarks|null, fps,
+ *     interpolated:boolean   // true on skipped (extrapolated) frames
  *   }
- *
- * The MediaPipe Tasks Vision module is imported dynamically from a CDN so this
- * file can live in a plain <script> without a build step.
  * ---------------------------------------------------------------------------
  */
 
@@ -36,14 +34,14 @@
   const THUMB_TIP = 4;
   const INDEX_TIP = 8;
 
-  // Connections for drawing the hand skeleton overlay.
+  // Hand skeleton connections for the telemetry overlay.
   const HAND_CONNECTIONS = [
-    [0, 1], [1, 2], [2, 3], [3, 4],            // thumb
-    [0, 5], [5, 6], [6, 7], [7, 8],            // index
-    [5, 9], [9, 10], [10, 11], [11, 12],       // middle
-    [9, 13], [13, 14], [14, 15], [15, 16],     // ring
-    [13, 17], [17, 18], [18, 19], [19, 20],    // pinky
-    [0, 17],                                   // palm base
+    [0, 1], [1, 2], [2, 3], [3, 4],
+    [0, 5], [5, 6], [6, 7], [7, 8],
+    [5, 9], [9, 10], [10, 11], [11, 12],
+    [9, 13], [13, 14], [14, 15], [15, 16],
+    [13, 17], [17, 18], [18, 19], [19, 20],
+    [0, 17],
   ];
 
   // Pinch hysteresis thresholds (normalized 3D distance).
@@ -51,10 +49,16 @@
   const PINCH_OFF = 0.07;
 
   // Swipe recognizer tuning.
-  const SWIPE_WINDOW = 6;      // frames tracked in the ring buffer
-  const SWIPE_DX = 0.22;       // min normalized horizontal travel
-  const SWIPE_MAX_DY = 0.12;   // max vertical variance to still count as horizontal
+  const SWIPE_WINDOW = 6;
+  const SWIPE_DX = 0.22;
+  const SWIPE_MAX_DY = 0.12;
   const SWIPE_COOLDOWN_MS = 650;
+
+  /* ------------------------------------------------------------------ *
+   * THROTTLING: run the model once every N rAF frames.                  *
+   * ------------------------------------------------------------------ */
+  const DETECT_EVERY = 3;          // 1 detection per 3 frames (~20 Hz @ 60 fps)
+  const MAX_EXTRAP_STEP = 0.045;   // clamp per-frame extrapolation (0..1 space)
 
   class VisionEngine {
     /**
@@ -67,7 +71,8 @@
     constructor({ video, overlay, onFrame, onStatus }) {
       this.video = video;
       this.overlay = overlay;
-      this.octx = overlay.getContext('2d');
+      // `desynchronized` lets the 2D overlay present off the main compositor path.
+      this.octx = overlay.getContext('2d', { desynchronized: true, alpha: true });
       this.onFrame = onFrame || (() => {});
       this.onStatus = onStatus || (() => {});
 
@@ -76,14 +81,24 @@
       this._rafId = null;
       this._lastVideoTime = -1;
 
-      // Debounced pinch state + edge flags.
+      // Frame throttling counter.
+      this._frameCount = 0;
+
+      // Debounced pinch state.
       this._pinch = false;
+
+      // Presence + interpolation state.
+      this._present = false;
+      // Last two *measured* fingertip samples for velocity extrapolation.
+      this._lastReal = null;   // { x, y, t }
+      this._prevReal = null;   // { x, y, t }
+      this._lastLandmarks = null;
 
       // Swipe ring buffer of { x, y, t }.
       this._track = [];
       this._lastSwipeAt = 0;
 
-      // FPS smoothing.
+      // FPS smoothing (loop cadence — reflects UI smoothness).
       this._fps = 0;
       this._lastT = performance.now();
 
@@ -96,7 +111,6 @@
     async init() {
       this.onStatus('loading', 'Loading vision model…');
       try {
-        // Dynamic import keeps us build-free while using the ES module bundle.
         const vision = await import(
           'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs'
         );
@@ -134,8 +148,15 @@
         throw new Error('getUserMedia unsupported');
       }
       try {
+        // HARD-CAPPED high-performance profile: 640x480 @ 30fps. `max` prevents
+        // the browser from negotiating an expensive HD/60fps stream.
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+          video: {
+            width: { ideal: 640, max: 640 },
+            height: { ideal: 480, max: 480 },
+            frameRate: { ideal: 30, max: 30 },
+            facingMode: 'user',
+          },
           audio: false,
         });
         this.video.srcObject = stream;
@@ -154,7 +175,6 @@
     }
 
     _syncOverlaySize() {
-      // Match the overlay's backing store to the video's intrinsic size.
       const w = this.video.videoWidth || 640;
       const h = this.video.videoHeight || 480;
       if (this.overlay.width !== w) this.overlay.width = w;
@@ -162,7 +182,7 @@
     }
 
     /* ---------------------------------------------------------------------
-     * Detection loop.
+     * Loop control.
      * ------------------------------------------------------------------ */
     start() {
       if (this.running) return;
@@ -184,55 +204,66 @@
     _loop() {
       if (!this.running) return;
       try {
-        this._detect();
+        this._tick();
       } catch (err) {
-        console.error('[vision] detect error:', err);
+        console.error('[vision] tick error:', err);
       }
       this._rafId = requestAnimationFrame(this._boundLoop);
     }
 
-    _detect() {
+    /* ---------------------------------------------------------------------
+     * One rAF tick. Decides between a heavy DETECTION frame and a light
+     * INTERPOLATION frame based on the throttle counter.
+     * ------------------------------------------------------------------ */
+    _tick() {
       if (this.video.readyState < 2) return; // not enough data yet
 
-      // FPS (EMA).
+      // FPS (EMA of loop cadence).
       const now = performance.now();
       const dt = now - this._lastT;
       this._lastT = now;
       if (dt > 0) this._fps = this._fps * 0.9 + (1000 / dt) * 0.1;
 
-      // Only run the model on fresh frames.
-      if (this.video.currentTime === this._lastVideoTime) {
-        this._rafId = requestAnimationFrame(this._boundLoop);
-        return;
-      }
-      this._lastVideoTime = this.video.currentTime;
+      this._frameCount += 1;
 
+      // Only run the model on the throttled cadence AND only on a fresh video
+      // frame (currentTime advances). Everything else interpolates.
+      const detectDue = this._frameCount % DETECT_EVERY === 0;
+      const freshFrame = this.video.currentTime !== this._lastVideoTime;
+
+      if (detectDue && freshFrame) {
+        this._lastVideoTime = this.video.currentTime;
+        this._runDetection(now);
+      } else {
+        this._emitInterpolated(now);
+      }
+    }
+
+    /* ---------------------------------------------------------------------
+     * HEAVY path — actual MediaPipe inference. Runs ~20x/sec.
+     * ------------------------------------------------------------------ */
+    _runDetection(now) {
       const result = this.landmarker.detectForVideo(this.video, now);
       this._syncOverlaySize();
 
       const hasHand = result && result.landmarks && result.landmarks.length > 0;
       if (!hasHand) {
+        this._present = false;
         this._pinch = false;
         this._track.length = 0;
+        this._lastReal = null;
+        this._prevReal = null;
+        this._lastLandmarks = null;
         this._clearOverlay();
-        this.onFrame({
-          present: false,
-          cursor: null,
-          pinch: false,
-          pinchStart: false,
-          pinchEnd: false,
-          swipe: null,
-          landmarks: null,
-          fps: Math.round(this._fps),
-        });
+        this.onFrame(this._event(false, null, false, false, null, false));
         return;
       }
 
       // Mirror X so on-screen motion matches the user (selfie view).
-      const raw = result.landmarks[0];
-      const lm = raw.map((p) => ({ x: 1 - p.x, y: p.y, z: p.z }));
+      const lm = result.landmarks[0].map((p) => ({ x: 1 - p.x, y: p.y, z: p.z }));
+      this._lastLandmarks = lm;
 
-      // ---- Pinch: 3D Euclidean distance with hysteresis ----------------
+      // ---- Pinch: 3D Euclidean distance with hysteresis -----------------
       const t = lm[THUMB_TIP];
       const i = lm[INDEX_TIP];
       const d = Math.sqrt(
@@ -244,30 +275,83 @@
       const pinchStart = !wasPinch && this._pinch;
       const pinchEnd = wasPinch && !this._pinch;
 
-      // ---- Swipe recognizer --------------------------------------------
+      // ---- Swipe recognizer ---------------------------------------------
       const center = this._handCenter(lm);
       this._track.push({ x: center.x, y: center.y, t: now });
       if (this._track.length > SWIPE_WINDOW) this._track.shift();
       const swipe = this._detectSwipe(now);
 
-      // ---- Telemetry overlay -------------------------------------------
+      // ---- Record measured fingertip samples for extrapolation ----------
+      this._present = true;
+      this._prevReal = this._lastReal;
+      this._lastReal = { x: i.x, y: i.y, t: now };
+
+      // ---- Telemetry overlay (only on detection frames) -----------------
       this._drawOverlay(lm, d, this._pinch);
 
-      // The cursor is the index fingertip.
-      this.onFrame({
-        present: true,
-        cursor: { x: i.x, y: i.y },
-        pinch: this._pinch,
-        pinchStart,
-        pinchEnd,
-        swipe,
-        landmarks: lm,
-        fps: Math.round(this._fps),
-      });
+      this.onFrame(
+        this._event(true, { x: i.x, y: i.y }, this._pinch, false, swipe, false, {
+          pinchStart,
+          pinchEnd,
+          landmarks: lm,
+        })
+      );
     }
 
+    /* ---------------------------------------------------------------------
+     * LIGHT path — no inference. Extrapolate the fingertip so the cursor
+     * keeps moving smoothly between detections. Never emits edge events.
+     * ------------------------------------------------------------------ */
+    _emitInterpolated(now) {
+      if (!this._present || !this._lastReal) {
+        // Nothing to interpolate — emit a cheap "no hand" frame.
+        this.onFrame(this._event(false, null, this._pinch, false, null, true));
+        return;
+      }
+
+      let cursor;
+      if (this._prevReal) {
+        // Velocity from the last two measured samples.
+        const span = Math.max(this._lastReal.t - this._prevReal.t, 1);
+        const vx = (this._lastReal.x - this._prevReal.x) / span;
+        const vy = (this._lastReal.y - this._prevReal.y) / span;
+        const elapsed = now - this._lastReal.t;
+        let px = this._lastReal.x + vx * elapsed;
+        let py = this._lastReal.y + vy * elapsed;
+        // Clamp the predicted step so a fast/erratic sample can't fling the cursor.
+        px = this._lastReal.x + this._clamp(px - this._lastReal.x, MAX_EXTRAP_STEP);
+        py = this._lastReal.y + this._clamp(py - this._lastReal.y, MAX_EXTRAP_STEP);
+        cursor = { x: this._clamp01(px), y: this._clamp01(py) };
+      } else {
+        // Only one sample so far — hold position.
+        cursor = { x: this._lastReal.x, y: this._lastReal.y };
+      }
+
+      // Carry the debounced pinch state forward; edges only fire on real frames.
+      this.onFrame(this._event(true, cursor, this._pinch, true, null, true));
+    }
+
+    /* ---------------------------------------------------------------------
+     * Event factory — keeps the emitted shape in exactly one place.
+     * ------------------------------------------------------------------ */
+    _event(present, cursor, pinch, _interpFlag, swipe, interpolated, extra = {}) {
+      return {
+        present,
+        cursor,
+        pinch,
+        pinchStart: extra.pinchStart || false,
+        pinchEnd: extra.pinchEnd || false,
+        swipe: swipe || null,
+        landmarks: extra.landmarks || null,
+        fps: Math.round(this._fps),
+        interpolated: !!interpolated,
+      };
+    }
+
+    _clamp(v, m) { return v > m ? m : v < -m ? -m : v; }
+    _clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+
     _handCenter(lm) {
-      // Palm-ish center: average of wrist(0), index MCP(5), pinky MCP(17).
       const a = lm[0], b = lm[5], c = lm[17];
       return { x: (a.x + b.x + c.x) / 3, y: (a.y + b.y + c.y) / 3 };
     }
@@ -279,22 +363,19 @@
       const xs = this._track.map((p) => p.x);
       const ys = this._track.map((p) => p.y);
       const dx = xs[xs.length - 1] - xs[0];
-
-      // Vertical variance must stay low to qualify as a horizontal swipe.
       const yMin = Math.min(...ys), yMax = Math.max(...ys);
       const dyRange = yMax - yMin;
 
       if (Math.abs(dx) > SWIPE_DX && dyRange < SWIPE_MAX_DY) {
         this._lastSwipeAt = now;
-        this._track.length = 0; // consume the gesture
-        // Cursor x is already mirrored, so +dx = moving right on screen.
+        this._track.length = 0;
         return dx > 0 ? 'SWIPE_RIGHT' : 'SWIPE_LEFT';
       }
       return null;
     }
 
     /* ---------------------------------------------------------------------
-     * Overlay drawing (telemetry debug frames).
+     * Overlay drawing (telemetry) — only invoked on detection frames.
      * ------------------------------------------------------------------ */
     _clearOverlay() {
       this.octx.clearRect(0, 0, this.overlay.width, this.overlay.height);
@@ -305,7 +386,6 @@
       const ctx = this.octx;
       ctx.clearRect(0, 0, W, H);
 
-      // Connections.
       ctx.lineWidth = 2;
       ctx.strokeStyle = pinch ? '#00ff9c' : '#00f3ff';
       ctx.beginPath();
@@ -316,7 +396,6 @@
       }
       ctx.stroke();
 
-      // Landmarks.
       for (let k = 0; k < lm.length; k++) {
         const p = lm[k];
         const isKey = k === THUMB_TIP || k === INDEX_TIP;
@@ -326,7 +405,6 @@
         ctx.fill();
       }
 
-      // Pinch distance readout + connecting line between tips.
       const t = lm[THUMB_TIP], i = lm[INDEX_TIP];
       ctx.strokeStyle = pinch ? '#00ff9c' : '#ffd000';
       ctx.lineWidth = 2;

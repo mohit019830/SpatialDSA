@@ -55,12 +55,104 @@
   const NODE_RADIUS = 1.15;
   const LERP = 0.18; // position/scale easing per frame — smooth structural moves
 
+  /* =========================================================================
+   * SHARED GEOMETRY + MATERIAL CACHE
+   *
+   * Rule: never `new` a geometry or material inside setModel()/the frame loop.
+   * All node/edge meshes reuse these singletons. Per-node color differences are
+   * handled by *cloning* only the cheap material (a shallow GPU-program share)
+   * or, for edges, by tinting a shared material — see _createEdgeMesh.
+   *
+   * Populated lazily by _initSharedAssets() once THREE is confirmed present.
+   * ====================================================================== */
+  const SHARED = {
+    ready: false,
+    // Geometry singletons (low-poly for performance).
+    sphereGeo: null,   // node body (16x16)
+    glowGeo: null,     // node glow shell (12x12)
+    cylGeo: null,      // edge cylinder (8 radial segs)
+    coneGeo: null,     // arrowhead (12 segs)
+    ringGeo: null,     // cursor ring
+    cursorCoreGeo: null,
+    // Material singletons keyed by state (created once, reused everywhere).
+    nodeMat: {},       // state -> MeshLambertMaterial
+    glowMat: {},       // state -> MeshBasicMaterial (additive)
+    cursorRingMat: null,
+    cursorRingHoverMat: null,
+    cursorCoreMat: null,
+  };
+
+  function _initSharedAssets() {
+    if (SHARED.ready) return;
+
+    // --- Low-poly geometry (16x16 spheres per the perf budget) -----------
+    SHARED.sphereGeo = new THREE.SphereGeometry(NODE_RADIUS, 16, 16);
+    SHARED.glowGeo = new THREE.SphereGeometry(NODE_RADIUS * 1.35, 12, 12);
+    SHARED.cylGeo = new THREE.CylinderGeometry(0.09, 0.09, 1, 8, 1, true);
+    SHARED.coneGeo = new THREE.ConeGeometry(0.32, 0.9, 12);
+    SHARED.ringGeo = new THREE.TorusGeometry(0.55, 0.06, 8, 24);
+    SHARED.cursorCoreGeo = new THREE.SphereGeometry(0.16, 10, 10);
+
+    // --- One material per state. MeshLambertMaterial is far cheaper than
+    //     MeshPhysicalMaterial (no transmission/refraction pass) while still
+    //     responding to the scene lights for a glassy neon look. --------------
+    for (const state of Object.keys(STATE_COLORS)) {
+      const color = STATE_COLORS[state];
+      SHARED.nodeMat[state] = new THREE.MeshLambertMaterial({
+        color,
+        emissive: color,
+        emissiveIntensity:
+          state === 'active' || state === 'compare' ? 0.9 : 0.4,
+        transparent: true,
+        opacity: 0.9,
+      });
+      SHARED.glowMat[state] = new THREE.MeshBasicMaterial({
+        color,
+        transparent: true,
+        opacity: state === 'default' ? 0.12 : 0.25,
+        blending: THREE.AdditiveBlending,
+        side: THREE.BackSide,
+        depthWrite: false,
+      });
+    }
+
+    // Edge materials: one shared cylinder + one shared cone material per state.
+    SHARED.edgeMat = {};
+    SHARED.coneMat = {};
+    for (const state of Object.keys(EDGE_COLORS)) {
+      const color = EDGE_COLORS[state];
+      SHARED.edgeMat[state] = new THREE.MeshBasicMaterial({
+        color,
+        transparent: true,
+        opacity: state === 'default' ? 0.55 : 0.95,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      });
+      SHARED.coneMat[state] = new THREE.MeshBasicMaterial({
+        color, transparent: true, opacity: 0.95, depthWrite: false,
+      });
+    }
+
+    SHARED.cursorRingMat = new THREE.MeshBasicMaterial({
+      color: 0x00f3ff, transparent: true, opacity: 0.9,
+    });
+    SHARED.cursorRingHoverMat = new THREE.MeshBasicMaterial({
+      color: 0x00ff9c, transparent: true, opacity: 0.9,
+    });
+    SHARED.cursorCoreMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+
+    SHARED.ready = true;
+  }
+
   class Renderer3D {
     /**
      * @param {HTMLCanvasElement} canvas
      */
     constructor(canvas) {
       this.canvas = canvas;
+
+      // Build the shared geometry/material singletons exactly once.
+      _initSharedAssets();
 
       // --- Core Three.js objects -----------------------------------------
       this.scene = new THREE.Scene();
@@ -74,11 +166,14 @@
 
       this.renderer = new THREE.WebGLRenderer({
         canvas,
-        antialias: true,
+        antialias: false,          // AA disabled — biggest cheap fill-rate win
         alpha: false,
         powerPreference: 'high-performance',
+        stencil: false,
+        depth: true,
       });
-      this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      // Cap DPR at 1.5 so retina panels don't quadruple the fragment count.
+      this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
       this.renderer.setSize(w || 1, h || 1, false);
       this.renderer.outputColorSpace = THREE.SRGBColorSpace;
 
@@ -112,6 +207,16 @@
       // into world space for spawning/dragging in empty space.
       this.workPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
 
+      // --- Raycast gating state ------------------------------------------
+      // We only cast a ray when (a) the cursor moved beyond RAYCAST_DELTA, or
+      // (b) pinch state changed. Otherwise we reuse the last hover result.
+      this._lastRayNx = -999;
+      this._lastRayNy = -999;
+      this._lastPinch = false;
+      this._lastHovered = null;
+      this._lastWorldPoint = new THREE.Vector3();
+      this.RAYCAST_DELTA = 0.01;   // normalized-screen movement gate
+
       // --- Mid-air cursor reticle ----------------------------------------
       this.cursor = this._makeCursor();
       this.scene.add(this.cursor);
@@ -123,8 +228,9 @@
 
       // --- Reusable temporaries (avoid per-frame allocations) ------------
       this._tmpVec3 = new THREE.Vector3();
+      this._tmpDir = new THREE.Vector3();
+      this._tmpMid = new THREE.Vector3();
       this._tmpQuat = new THREE.Quaternion();
-      this._tmpMat = new THREE.Matrix4();
       this._up = new THREE.Vector3(0, 1, 0);
 
       this._running = false;
@@ -137,17 +243,11 @@
      * ------------------------------------------------------------------ */
     _makeCursor() {
       const group = new THREE.Group();
-      const ringGeo = new THREE.TorusGeometry(0.55, 0.06, 12, 32);
-      const ringMat = new THREE.MeshBasicMaterial({
-        color: 0x00f3ff,
-        transparent: true,
-        opacity: 0.9,
-      });
-      group.add(new THREE.Mesh(ringGeo, ringMat));
-
-      const coreGeo = new THREE.SphereGeometry(0.16, 16, 16);
-      const coreMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-      group.add(new THREE.Mesh(coreGeo, coreMat));
+      // Uses shared geometry + materials — no per-instance allocation.
+      const ring = new THREE.Mesh(SHARED.ringGeo, SHARED.cursorRingMat);
+      group.add(ring);
+      group.userData.ring = ring;
+      group.add(new THREE.Mesh(SHARED.cursorCoreGeo, SHARED.cursorCoreMat));
 
       group.visible = false;
       group.renderOrder = 999;
@@ -200,42 +300,23 @@
       group.userData.uuid = node.uuid;
       group.userData.kind = 'node';
 
-      const geo = new THREE.SphereGeometry(NODE_RADIUS, 48, 48);
-      // Physical material with transmission == glass-morphism look.
-      const mat = new THREE.MeshPhysicalMaterial({
-        color: STATE_COLORS[node.state] || STATE_COLORS.default,
-        metalness: 0.1,
-        roughness: 0.08,
-        transmission: 0.9,
-        thickness: 1.4,
-        ior: 1.35,
-        clearcoat: 1.0,
-        clearcoatRoughness: 0.1,
-        transparent: true,
-        opacity: 0.92,
-        emissive: STATE_COLORS[node.state] || STATE_COLORS.default,
-        emissiveIntensity: 0.35,
-      });
-      const sphere = new THREE.Mesh(geo, mat);
+      const state = STATE_COLORS[node.state] ? node.state : 'default';
+      // Shared low-poly geometry; assign the shared per-state material directly.
+      // State changes swap the material reference (see _applyNodeColor) rather
+      // than mutating color, so we never touch a shared material's properties.
+      const sphere = new THREE.Mesh(SHARED.sphereGeo, SHARED.nodeMat[state]);
       sphere.userData.uuid = node.uuid; // so raycast hits resolve to the node
       sphere.userData.kind = 'node';
       group.add(sphere);
       group.userData.sphere = sphere;
 
-      // Outer glow shell (additive) for the neon bloom feel.
-      const glowMat = new THREE.MeshBasicMaterial({
-        color: STATE_COLORS[node.state] || STATE_COLORS.default,
-        transparent: true,
-        opacity: 0.12,
-        blending: THREE.AdditiveBlending,
-        side: THREE.BackSide,
-      });
-      const glow = new THREE.Mesh(
-        new THREE.SphereGeometry(NODE_RADIUS * 1.35, 32, 32),
-        glowMat
-      );
+      // Outer glow shell (additive) reuses shared geometry + material.
+      const glow = new THREE.Mesh(SHARED.glowGeo, SHARED.glowMat[state]);
       group.add(glow);
       group.userData.glow = glow;
+
+      // Precompute an AABB half-extent (world units) for cheap proximity tests.
+      group.userData.aabbHalf = NODE_RADIUS * 1.35;
 
       // Value label as a camera-facing sprite.
       const tex = this._labelTexture(node.value);
@@ -269,25 +350,14 @@
       group.userData.to = edge.to;
       group.userData.directed = edge.directed;
 
-      const color = EDGE_COLORS[edge.state] || EDGE_COLORS.default;
-      const mat = new THREE.MeshBasicMaterial({
-        color,
-        transparent: true,
-        opacity: 0.85,
-        blending: THREE.AdditiveBlending,
-      });
-      const cyl = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.09, 0.09, 1, 12, 1, true),
-        mat
-      );
+      const state = EDGE_COLORS[edge.state] ? edge.state : 'default';
+      // Shared geometry + shared per-state material (no allocation).
+      const cyl = new THREE.Mesh(SHARED.cylGeo, SHARED.edgeMat[state]);
       group.add(cyl);
       group.userData.cyl = cyl;
 
       if (edge.directed) {
-        const cone = new THREE.Mesh(
-          new THREE.ConeGeometry(0.32, 0.9, 16),
-          new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.95 })
-        );
+        const cone = new THREE.Mesh(SHARED.coneGeo, SHARED.coneMat[state]);
         group.add(cone);
         group.userData.cone = cone;
       }
@@ -366,25 +436,20 @@
     }
 
     _applyNodeColor(group, state) {
-      const color = STATE_COLORS[state] || STATE_COLORS.default;
-      const sphere = group.userData.sphere;
-      const glow = group.userData.glow;
-      sphere.material.color.setHex(color);
-      sphere.material.emissive.setHex(color);
-      // Emphasize active/compare states with stronger emission.
-      sphere.material.emissiveIntensity =
-        state === 'active' || state === 'compare' ? 0.9 : 0.35;
-      glow.material.color.setHex(color);
-      glow.material.opacity = state === 'default' ? 0.12 : 0.25;
-      group.userData.state = state;
+      const key = SHARED.nodeMat[state] ? state : 'default';
+      if (group.userData.state === key) return; // no-op if unchanged
+      // Swap to the pre-built shared material — no property mutation, no alloc.
+      group.userData.sphere.material = SHARED.nodeMat[key];
+      group.userData.glow.material = SHARED.glowMat[key];
+      group.userData.state = key;
     }
 
     _applyEdgeColor(group, state) {
-      const color = EDGE_COLORS[state] || EDGE_COLORS.default;
-      group.userData.cyl.material.color.setHex(color);
-      group.userData.cyl.material.opacity = state === 'default' ? 0.55 : 0.95;
-      if (group.userData.cone) group.userData.cone.material.color.setHex(color);
-      group.userData.state = state;
+      const key = SHARED.edgeMat[state] ? state : 'default';
+      if (group.userData.state === key) return;
+      group.userData.cyl.material = SHARED.edgeMat[key];
+      if (group.userData.cone) group.userData.cone.material = SHARED.coneMat[key];
+      group.userData.state = key;
     }
 
     /* ---------------------------------------------------------------------
@@ -402,7 +467,8 @@
 
       const start = a.position;
       const end = b.position;
-      const dir = this._tmpVec3.copy(end).sub(start);
+      // Reuse preallocated temporaries — zero allocation per frame.
+      const dir = this._tmpDir.copy(end).sub(start);
       const len = dir.length();
       if (len < 1e-4) {
         group.visible = false;
@@ -412,13 +478,12 @@
       // Shorten so the cylinder stops at the sphere surfaces.
       const gap = NODE_RADIUS;
       const usable = Math.max(len - gap * 2, 0.01);
-      const mid = this._tmpVec3.clone().copy(start).addScaledVector(dir, 0.5);
-
+      const mid = this._tmpMid.copy(start).addScaledVector(dir, 0.5);
       group.position.copy(mid);
 
-      // Orient +Y cylinder to align with dir.
-      const ndir = dir.clone().normalize();
-      this._tmpQuat.setFromUnitVectors(this._up, ndir);
+      // Orient +Y cylinder to align with dir (dir normalized in place).
+      dir.normalize();
+      this._tmpQuat.setFromUnitVectors(this._up, dir);
       group.quaternion.copy(this._tmpQuat);
 
       const cyl = group.userData.cyl;
@@ -439,37 +504,97 @@
      * (already un-mirrored by the caller). Returns hovered node uuid (or null)
      * and a world point on the work plane.
      * ------------------------------------------------------------------ */
-    updateCursor(nx, ny, visible) {
+    updateCursor(nx, ny, visible, pinch = false) {
       this._cursorActive = !!visible;
       this.cursor.visible = !!visible;
-      if (!visible) return { hovered: null, worldPoint: null };
+      if (!visible) {
+        this._lastRayNx = -999;
+        this._lastRayNy = -999;
+        return { hovered: null, worldPoint: null };
+      }
 
       // Convert 0..1 (top-left origin) to NDC -1..1 (bottom-left origin).
       this.pointerNDC.x = nx * 2 - 1;
       this.pointerNDC.y = -(ny * 2 - 1);
-
       this.raycaster.setFromCamera(this.pointerNDC, this.camera);
 
-      // World point on the z=0 work plane (for spawning/dragging in space).
-      const worldPoint = new THREE.Vector3();
+      // World point on the z=0 work plane. This is cheap ray/plane math (no
+      // geometry traversal), so we always update it for smooth dragging.
+      const worldPoint = this._lastWorldPoint;
       this.raycaster.ray.intersectPlane(this.workPlane, worldPoint);
-      if (worldPoint) {
-        this.cursor.position.copy(worldPoint);
+      this.cursor.position.copy(worldPoint);
+
+      // ---- Gate the EXPENSIVE hover raycast ----------------------------
+      // Per the perf budget, only cast when BOTH the cursor moved past
+      // RAYCAST_DELTA AND the user is pinching. We additionally always cast on
+      // the pinch-down edge (pinchChanged → true) so onPinchStart gets an
+      // accurate grab target the instant the pinch begins.
+      const dx = Math.abs(nx - this._lastRayNx);
+      const dy = Math.abs(ny - this._lastRayNy);
+      const pinchChanged = pinch !== this._lastPinch;
+      const moved = dx > this.RAYCAST_DELTA || dy > this.RAYCAST_DELTA;
+      const pinchDown = pinchChanged && pinch;
+
+      if ((moved && pinch) || pinchDown) {
+        this._lastRayNx = nx;
+        this._lastRayNy = ny;
+        this._lastHovered = this._hoverTest(worldPoint);
+
+        // Recolor cursor ring by swapping the shared material (no mutation).
+        const ring = this.cursor.userData.ring;
+        ring.material = this._lastHovered
+          ? SHARED.cursorRingHoverMat
+          : SHARED.cursorRingMat;
+      } else if (!pinch && this._lastHovered) {
+        // Released: drop the hover highlight without paying for a raycast.
+        this._lastHovered = null;
+        this.cursor.userData.ring.material = SHARED.cursorRingMat;
       }
 
-      // Hover test against node spheres only.
-      const spheres = [];
+      // Track pinch every call so edge detection stays correct even on frames
+      // we don't raycast.
+      this._lastPinch = pinch;
+
+      return {
+        hovered: this._lastHovered,
+        worldPoint: worldPoint.clone(),
+      };
+    }
+
+    /* ---------------------------------------------------------------------
+     * Hover test with a cheap AABB proximity pre-filter.
+     *
+     * Full mesh raycasting walks every triangle of every sphere. Instead we
+     * first reject nodes whose bounding box the ray misses (a few multiplies
+     * per node), and only run intersectObjects on the tiny surviving set.
+     * ------------------------------------------------------------------ */
+    _hoverTest(worldPoint) {
+      const ray = this.raycaster.ray;
+      const candidates = [];
+
       for (const group of this.nodeMeshes.values()) {
-        if (group.userData.sphere) spheres.push(group.userData.sphere);
+        const sphere = group.userData.sphere;
+        if (!sphere) continue;
+        const p = group.position;
+        const half = group.userData.aabbHalf || NODE_RADIUS;
+
+        // (1) Broad phase A: on the z=0 work plane the cursor lives at
+        //     worldPoint; if the node is nowhere near it, skip immediately.
+        const pdx = p.x - worldPoint.x;
+        const pdy = p.y - worldPoint.y;
+        if (pdx * pdx + pdy * pdy > (half * 2.5) * (half * 2.5)) continue;
+
+        // (2) Broad phase B: AABB — does the ray pass within the node's box?
+        //     distanceSqToPoint is a handful of ops vs full triangle casting.
+        if (ray.distanceSqToPoint(p) <= half * half) {
+          candidates.push(sphere);
+        }
       }
-      const hits = this.raycaster.intersectObjects(spheres, false);
-      const hovered = hits.length ? hits[0].object.userData.uuid : null;
 
-      // Recolor cursor to signal hover.
-      const ring = this.cursor.children[0];
-      ring.material.color.setHex(hovered ? 0x00ff9c : 0x00f3ff);
-
-      return { hovered, worldPoint: worldPoint ? worldPoint.clone() : null };
+      if (candidates.length === 0) return null;
+      // Narrow phase: only the survivors get a precise intersection test.
+      const hits = this.raycaster.intersectObjects(candidates, false);
+      return hits.length ? hits[0].object.userData.uuid : null;
     }
 
     /** Project a world position back to normalized 0..1 screen coords. */
@@ -482,16 +607,14 @@
      * Resource disposal to prevent GPU leaks when nodes/edges are removed.
      * ------------------------------------------------------------------ */
     _disposeGroup(group) {
-      group.traverse((obj) => {
-        if (obj.geometry) obj.geometry.dispose();
-        if (obj.material) {
-          const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-          mats.forEach((m) => {
-            if (m.map) m.map.dispose();
-            m.dispose();
-          });
-        }
-      });
+      // IMPORTANT: node/edge geometry and materials are SHARED singletons —
+      // disposing them would corrupt every other mesh. We only dispose the
+      // per-node sprite label texture/material, which is uniquely allocated.
+      const sprite = group.userData.sprite;
+      if (sprite && sprite.material) {
+        if (sprite.material.map) sprite.material.map.dispose();
+        sprite.material.dispose();
+      }
     }
 
     /* ---------------------------------------------------------------------
