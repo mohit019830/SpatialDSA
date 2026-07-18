@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spatial DSA Visualizer — Air-Gesture Algorithm Lab</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- ================= TOP BAR ================= -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">◆</span>
+      <span class="brand-name">SPATIAL<span class="accent">DSA</span></span>
+      <span class="brand-sub">// air-gesture algorithm lab</span>
+    </div>
+    <div class="topbar-status">
+      <span id="fpsBadge" class="badge">FPS --</span>
+      <span id="stepBadge" class="badge">STEP --</span>
+      <span id="algoBadge" class="badge badge-accent">LINKED LIST</span>
+    </div>
+  </header>
+
+  <!-- ================= MAIN SPLIT ================= -->
+  <main class="dashboard">
+    <!-- ---------- LEFT PANEL (30%) : Control Hub ---------- -->
+    <aside class="panel-left">
+      <!-- Webcam + MediaPipe telemetry -->
+      <section class="card webcam-card">
+        <div class="card-head">
+          <h2>Vision Feed</h2>
+          <span id="visionStatus" class="pill pill-idle">offline</span>
+        </div>
+        <div class="webcam-stage">
+          <video id="webcam" playsinline muted autoplay></video>
+          <canvas id="overlay" class="overlay"></canvas>
+          <div class="scanlines" aria-hidden="true"></div>
+        </div>
+        <p class="hint">Pinch (thumb + index) to grab. Drag in empty space to spawn nodes.</p>
+      </section>
+
+      <!-- Voice command indicator -->
+      <section class="card voice-card">
+        <div class="card-head">
+          <h2>Voice Command</h2>
+          <button id="voiceToggle" class="btn-mini">enable</button>
+        </div>
+        <div class="voice-body">
+          <span id="voiceOrb" class="voice-orb voice-idle"></span>
+          <div class="voice-meta">
+            <span id="voiceState" class="voice-state">Voice off</span>
+            <span class="voice-legend">"execute" · "next" · "back" · "reset"</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- C++ code trace panel -->
+      <section class="card code-card">
+        <div class="card-head">
+          <h2>C++ Trace</h2>
+          <span id="descBadge" class="desc-badge">idle</span>
+        </div>
+        <nav class="tabs" id="algoTabs">
+          <button class="tab active" data-algo="linkedListReversal">Linked List</button>
+          <button class="tab" data-algo="bstInsert">BST Insert</button>
+          <button class="tab" data-algo="bstDelete">BST Delete</button>
+          <button class="tab" data-algo="dfs">DFS</button>
+          <button class="tab" data-algo="dijkstra">Dijkstra</button>
+        </nav>
+        <pre class="code-block"><code id="codeTrace"></code></pre>
+      </section>
+
+      <!-- Manual controls (fallback + accessibility) -->
+      <section class="card controls-card">
+        <div class="controls-row">
+          <button class="btn" id="btnBuild">Build Trace</button>
+          <button class="btn" id="btnExecute">Execute ▶</button>
+        </div>
+        <div class="controls-row">
+          <button class="btn btn-ghost" id="btnBack">◀ Back</button>
+          <button class="btn btn-ghost" id="btnForward">Next ▶</button>
+          <button class="btn btn-danger" id="btnClear">Reset</button>
+        </div>
+        <div class="controls-row seed-row">
+          <input id="seedValue" class="seed-input" type="number" placeholder="value" />
+          <button class="btn btn-ghost" id="btnSeedNode">+ Node</button>
+          <button class="btn btn-ghost" id="btnSeedDemo">Demo Data</button>
+        </div>
+      </section>
+    </aside>
+
+    <!-- ---------- RIGHT PANEL (70%) : 3D Universe ---------- -->
+    <section class="panel-right">
+      <canvas id="scene"></canvas>
+
+      <!-- HUD overlays on top of the 3D canvas -->
+      <div class="hud hud-topleft">
+        <div id="hudMode" class="hud-chip">MODE · IDLE</div>
+        <div id="hudPinch" class="hud-chip">PINCH · no</div>
+      </div>
+      <div class="hud hud-bottom">
+        <span id="hudDesc" class="hud-desc">Spawn nodes in mid-air, then Build &amp; Execute an algorithm.</span>
+      </div>
+
+      <!-- Legend -->
+      <div class="hud hud-topright legend">
+        <span><i class="dot dot-default"></i>node</span>
+        <span><i class="dot dot-active"></i>active</span>
+        <span><i class="dot dot-compare"></i>compare</span>
+        <span><i class="dot dot-path"></i>path</span>
+        <span><i class="dot dot-added"></i>added</span>
+      </div>
+
+      <!-- Boot / error splash -->
+      <div id="splash" class="splash">
+        <div class="splash-inner">
+          <div class="splash-spinner"></div>
+          <h1>Initializing Spatial Lab</h1>
+          <p id="splashMsg">Booting 3D engine…</p>
+          <button id="splashEnter" class="btn btn-big" hidden>Enter Lab</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ================= DEPENDENCIES (CDN) ================= -->
+  <!-- Three.js core (UMD build exposes global THREE). Pinned version. -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+
+  <!-- App modules. Order matters: engines first, orchestrator last. -->
+  <script src="dsaEngine.js"></script>
+  <script src="render3d.js"></script>
+  <script src="vision.js"></script>
+  <script src="speech.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
