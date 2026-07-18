@@ -44,15 +44,24 @@
     [0, 17],
   ];
 
-  // Pinch hysteresis thresholds (normalized 3D distance).
-  const PINCH_ON = 0.045;
-  const PINCH_OFF = 0.07;
+  // Pinch SPLIT-THRESHOLD hysteresis (normalized 3D distance).
+  //   START  a pinch / draw:    d < PINCH_START   (deliberate, tight)
+  //   MAINTAIN while moving:     d < PINCH_RELEASE (wide band — the fix for
+  //                                                 mid-flight edge drops)
+  //   RELEASE / drop:            d > PINCH_RELEASE
+  // The gap between START and RELEASE is what stops the pinch from flickering
+  // off while you drag a node or draw an edge across the scene.
+  const PINCH_START = 0.025;
+  const PINCH_RELEASE = 0.055;
 
-  // Swipe recognizer tuning.
-  const SWIPE_WINDOW = 6;
-  const SWIPE_DX = 0.22;
-  const SWIPE_MAX_DY = 0.12;
-  const SWIPE_COOLDOWN_MS = 650;
+  // Velocity-based swipe (frame-velocity ring buffer over the index fingertip).
+  // Instead of requiring a big absolute sweep, we fire on a *sharp flick*: high
+  // horizontal velocity across a short travel while vertical wobble stays low.
+  const SWIPE_BUFFER = 8;            // frames of fingertip history to keep
+  const SWIPE_VELOCITY = 0.0012;     // normalized-x per ms — the "sharp" gate
+  const SWIPE_MIN_DX = 0.10;         // min horizontal travel (~10 cm hand flick)
+  const SWIPE_MAX_DY = 0.10;         // max vertical variance to still count
+  const SWIPE_COOLDOWN_MS = 450;     // min gap between swipes
 
   /* ------------------------------------------------------------------ *
    * THROTTLING: run the model once every N rAF frames.                  *
@@ -263,22 +272,25 @@
       const lm = result.landmarks[0].map((p) => ({ x: 1 - p.x, y: p.y, z: p.z }));
       this._lastLandmarks = lm;
 
-      // ---- Pinch: 3D Euclidean distance with hysteresis -----------------
+      // ---- Pinch: 3D Euclidean distance with SPLIT-THRESHOLD hysteresis --
+      // Starting a pinch requires a deliberately tight distance (PINCH_START),
+      // but once engaged we only release past the much wider PINCH_RELEASE.
+      // That wide "maintain" band is what keeps an edge-draw or node-drag alive
+      // when the fingers drift slightly apart mid-gesture.
       const t = lm[THUMB_TIP];
       const i = lm[INDEX_TIP];
       const d = Math.sqrt(
         (i.x - t.x) ** 2 + (i.y - t.y) ** 2 + (i.z - t.z) ** 2
       );
       const wasPinch = this._pinch;
-      if (!this._pinch && d < PINCH_ON) this._pinch = true;
-      else if (this._pinch && d > PINCH_OFF) this._pinch = false;
+      if (!this._pinch && d < PINCH_START) this._pinch = true;
+      else if (this._pinch && d > PINCH_RELEASE) this._pinch = false;
       const pinchStart = !wasPinch && this._pinch;
       const pinchEnd = wasPinch && !this._pinch;
 
-      // ---- Swipe recognizer ---------------------------------------------
-      const center = this._handCenter(lm);
-      this._track.push({ x: center.x, y: center.y, t: now });
-      if (this._track.length > SWIPE_WINDOW) this._track.shift();
+      // ---- Swipe recognizer: index-fingertip velocity ring buffer -------
+      this._track.push({ x: i.x, y: i.y, t: now });
+      if (this._track.length > SWIPE_BUFFER) this._track.shift();
       const swipe = this._detectSwipe(now);
 
       // ---- Record measured fingertip samples for extrapolation ----------
@@ -351,25 +363,46 @@
     _clamp(v, m) { return v > m ? m : v < -m ? -m : v; }
     _clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
 
-    _handCenter(lm) {
-      const a = lm[0], b = lm[5], c = lm[17];
-      return { x: (a.x + b.x + c.x) / 3, y: (a.y + b.y + c.y) / 3 };
-    }
-
+    /* ---------------------------------------------------------------------
+     * VELOCITY-BASED INSTANT SWIPE.
+     *
+     * Rather than waiting for a large absolute sweep to accumulate, we measure
+     * the horizontal velocity of the index fingertip across the ring buffer:
+     *
+     *     velocity = (x_now - x_8_frames_ago) / (t_now - t_8_frames_ago)
+     *
+     * A sharp flick clears SWIPE_VELOCITY almost instantly, so a short (~10 cm)
+     * quick motion triggers — while a slow drag never will. We still gate on a
+     * minimum travel (rejects jitter) and low vertical variance (rejects
+     * diagonal / vertical motion).
+     * ------------------------------------------------------------------ */
     _detectSwipe(now) {
-      if (this._track.length < SWIPE_WINDOW) return null;
+      if (this._track.length < SWIPE_BUFFER) return null;
       if (now - this._lastSwipeAt < SWIPE_COOLDOWN_MS) return null;
 
-      const xs = this._track.map((p) => p.x);
-      const ys = this._track.map((p) => p.y);
-      const dx = xs[xs.length - 1] - xs[0];
-      const yMin = Math.min(...ys), yMax = Math.max(...ys);
+      const first = this._track[0];
+      const last = this._track[this._track.length - 1];
+
+      const dx = last.x - first.x;                     // signed horizontal travel
+      const dt = Math.max(last.t - first.t, 1);        // ms across the buffer
+      const velocity = dx / dt;                        // normalized-x per ms
+
+      // Vertical variance across the whole buffer must stay low.
+      let yMin = Infinity, yMax = -Infinity;
+      for (const p of this._track) {
+        if (p.y < yMin) yMin = p.y;
+        if (p.y > yMax) yMax = p.y;
+      }
       const dyRange = yMax - yMin;
 
-      if (Math.abs(dx) > SWIPE_DX && dyRange < SWIPE_MAX_DY) {
+      if (
+        Math.abs(velocity) > SWIPE_VELOCITY &&
+        Math.abs(dx) > SWIPE_MIN_DX &&
+        dyRange < SWIPE_MAX_DY
+      ) {
         this._lastSwipeAt = now;
-        this._track.length = 0;
-        return dx > 0 ? 'SWIPE_RIGHT' : 'SWIPE_LEFT';
+        this._track.length = 0;              // consume the buffer so it can't re-fire
+        return velocity > 0 ? 'SWIPE_RIGHT' : 'SWIPE_LEFT';
       }
       return null;
     }

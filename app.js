@@ -93,7 +93,12 @@
   /* =========================================================================
    * Interaction state machine (driven by vision events)
    * ====================================================================== */
-  const CONNECT_RADIUS = 3.2;   // world units: release within this of a node → connect
+  // Edge target snapping: on release, snap the pointer to the closest node
+  // within this geometric bounding radius instead of discarding the edge.
+  const CONNECT_RADIUS = 2.0;      // world units — link snap radius
+  // Ghost-node guards.
+  const SPAWN_MIN_GAP = 1.5;       // world units — no spawn within this of a node
+  const SPAWN_COOLDOWN_MS = 350;   // ms after any release during which spawns are banned
 
   const gesture = {
     dragTarget: null,       // uuid of node currently following the finger
@@ -101,6 +106,10 @@
     sourceNode: null,       // uuid pinched first (edge source candidate)
     spawnedThisPinch: false // did this pinch create a new node?
   };
+
+  // Timestamp of the last pinch release. New node generation is banned for
+  // SPAWN_COOLDOWN_MS afterward so releasing/moving the hand can't drop ghosts.
+  let lastInteractionTime = 0;
 
   /* =========================================================================
    * C++ syntax highlighting (lightweight tokenizer)
@@ -244,17 +253,22 @@
   /* =========================================================================
    * Gesture handling — the heart of the mid-air interaction
    * ====================================================================== */
-  function nearestOtherNode(worldPoint, excludeUuid) {
+  /**
+   * Closest node to a world point, optionally excluding one uuid, within a
+   * given radius. Returns { node, dist } or null. Used both for edge-target
+   * SNAPPING and for the ghost-node proximity guard.
+   */
+  function closestNode(worldPoint, excludeUuid, radius) {
     let best = null, bestD = Infinity;
     for (const n of currentModel.nodes) {
-      if (n.uuid === excludeUuid) continue;
+      if (excludeUuid && n.uuid === excludeUuid) continue;
       const dx = n.position.x - worldPoint.x;
       const dy = n.position.y - worldPoint.y;
       const dz = n.position.z - worldPoint.z;
       const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
       if (d < bestD) { bestD = d; best = n; }
     }
-    return bestD <= CONNECT_RADIUS ? best : null;
+    return best && bestD <= radius ? { node: best, dist: bestD } : null;
   }
 
   function onPinchStart(hovered, worldPoint) {
@@ -267,15 +281,30 @@
       gesture.dragOrigin = node ? { ...node.position } : { ...worldPoint };
       gesture.spawnedThisPinch = false;
       setMode('GRAB');
-    } else {
-      // Empty space: spawn a node and drag it under the finger.
-      const node = engine.addNode(nextValue(), worldPoint);
-      gesture.dragTarget = node.uuid;
-      gesture.sourceNode = null;      // spawning is not an edge gesture
-      gesture.dragOrigin = { ...worldPoint };
-      gesture.spawnedThisPinch = true;
-      setMode('SPAWN');
+      return;
     }
+
+    // ---- Empty space → SPAWN, guarded against ghost nodes ----------------
+    // Guard 1 (debounce): reject spawns inside the post-release cooldown, so
+    // the tail end of a drag/connect release can't drop a stray node.
+    const sinceRelease = performance.now() - lastInteractionTime;
+    if (sinceRelease < SPAWN_COOLDOWN_MS) {
+      setMode('IDLE');
+      return;
+    }
+    // Guard 2 (radius lock): reject spawns that land on top of an existing
+    // node — those are almost always a mis-detected grab, not a new node.
+    if (closestNode(worldPoint, null, SPAWN_MIN_GAP)) {
+      setMode('IDLE');
+      return;
+    }
+
+    const node = engine.addNode(nextValue(), worldPoint);
+    gesture.dragTarget = node.uuid;
+    gesture.sourceNode = null;      // spawning is not an edge gesture
+    gesture.dragOrigin = { ...worldPoint };
+    gesture.spawnedThisPinch = true;
+    setMode('SPAWN');
   }
 
   function onPinchMove(worldPoint) {
@@ -285,17 +314,32 @@
   }
 
   function onPinchEnd(hovered, worldPoint) {
+    // Stamp the release time up front so the spawn debounce covers every exit
+    // path below (connect, plain move, or abort).
+    lastInteractionTime = performance.now();
+
     // Connect gesture: pinched a node, released near a *different* node.
     if (gesture.sourceNode && !gesture.spawnedThisPinch && worldPoint) {
-      const target = nearestOtherNode(worldPoint, gesture.sourceNode);
-      if (target) {
+      // TARGET SNAPPING: prefer the raycast-hovered node, otherwise snap to the
+      // closest node mesh within CONNECT_RADIUS. Only if nothing is in range do
+      // we treat the release as "no link" and discard the edge.
+      let targetUuid = null;
+      if (hovered && hovered !== gesture.sourceNode) {
+        targetUuid = hovered;
+      } else {
+        const snap = closestNode(worldPoint, gesture.sourceNode, CONNECT_RADIUS);
+        if (snap) targetUuid = snap.node.uuid;
+      }
+
+      if (targetUuid) {
         // Treat it as a connect, not a move: restore the source's origin…
         if (gesture.dragOrigin) engine.moveNode(gesture.sourceNode, gesture.dragOrigin);
-        // …and draw the directed pointer.
-        engine.addEdge(gesture.sourceNode, target.uuid, { directed: true, weight: 1 });
+        // …and draw the directed pointer, snapped to the resolved target.
+        engine.addEdge(gesture.sourceNode, targetUuid, { directed: true, weight: 1 });
         setMode('LINK');
       }
     }
+
     // Reset gesture state.
     gesture.dragTarget = null;
     gesture.sourceNode = null;

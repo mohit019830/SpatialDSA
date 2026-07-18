@@ -117,13 +117,19 @@ so on-screen motion matches your real motion.
 Detail on the tunables behind each gesture:
 
 - **Pinch** uses a 3D Euclidean distance between thumb tip and index tip with
-  **hysteresis**: it turns *on* below `0.045` and only turns *off* above `0.07`
-  (normalized units). This prevents rapid on/off chatter at the threshold.
-- **Connect radius**: releasing a pinch within **3.2 world units** of another node
-  triggers the link. Farther than that, it's treated as a plain move.
-- **Swipe** recognizer watches a 6-frame ring buffer of the hand center. It fires when
-  horizontal travel exceeds `0.22` while vertical wobble stays under `0.12`, with a
-  **650 ms cooldown** so one swipe can't double-fire.
+  **split-threshold hysteresis**: it *starts* only below `0.025` (a deliberate, tight
+  pinch) but is *maintained* until the fingers drift past `0.055`. The wide "maintain"
+  band is what keeps a node-drag or edge-draw alive through mid-gesture jitter.
+- **Connect (target snapping)**: on release, the edge snaps to the raycast-hovered node,
+  or failing that to the closest node within **2.0 world units**. Only if nothing is in
+  range is the edge discarded.
+- **Ghost-node guards**: a new node is *never* spawned within **1.5 world units** of an
+  existing node, nor within **350 ms** of any pinch release — the two conditions that
+  previously produced stray "ghost" nodes.
+- **Swipe** uses an 8-frame **velocity ring buffer** on the index fingertip. It fires the
+  instant horizontal velocity exceeds `0.0012` (norm-x per ms) over at least a `0.10`
+  travel (~10 cm flick) while vertical variance stays under `0.10`, with a **450 ms
+  cooldown**. A sharp short flick triggers immediately — no big sweep required.
 
 The mid-air cursor is a glowing ring + core reticle. It turns **green** when hovering a
 grabbable node and **cyan** otherwise.
@@ -366,15 +372,18 @@ Most tuning lives as named constants near the top of each file:
 
 | Constant | File | Default | Effect |
 | --- | --- | --- | --- |
-| `PINCH_ON` / `PINCH_OFF` | `vision.js` | `0.045` / `0.07` | Pinch hysteresis thresholds. |
-| `SWIPE_WINDOW` | `vision.js` | `6` | Frames tracked for swipe detection. |
-| `SWIPE_DX` / `SWIPE_MAX_DY` | `vision.js` | `0.22` / `0.12` | Min horizontal travel / max vertical wobble. |
-| `SWIPE_COOLDOWN_MS` | `vision.js` | `650` | Minimum gap between swipes. |
+| `PINCH_START` / `PINCH_RELEASE` | `vision.js` | `0.025` / `0.055` | Split-threshold pinch hysteresis (start tight, maintain/release wide). |
+| `SWIPE_BUFFER` | `vision.js` | `8` | Fingertip X/Y samples in the velocity ring buffer. |
+| `SWIPE_VELOCITY` | `vision.js` | `0.0012` | Horizontal flick velocity (norm-x per ms) that triggers a swipe. |
+| `SWIPE_MIN_DX` / `SWIPE_MAX_DY` | `vision.js` | `0.10` / `0.10` | Min horizontal travel / max vertical variance. |
+| `SWIPE_COOLDOWN_MS` | `vision.js` | `450` | Minimum gap between swipes. |
 | `DETECT_EVERY` | `vision.js` | `3` | Run inference every N frames. |
 | `NODE_RADIUS` | `render3d.js` | `1.15` | Node sphere size (world units). |
 | `LERP` | `render3d.js` | `0.18` | Position/scale easing per frame. |
 | `RAYCAST_DELTA` | `render3d.js` | `0.01` | Cursor-move gate before re-raycasting. |
-| `CONNECT_RADIUS` | `app.js` | `3.2` | Release distance that counts as a connect. |
+| `CONNECT_RADIUS` | `app.js` | `2.0` | Edge-target snap radius on release. |
+| `SPAWN_MIN_GAP` | `app.js` | `1.5` | No new node spawns within this of an existing node. |
+| `SPAWN_COOLDOWN_MS` | `app.js` | `350` | Post-release window during which spawns are banned. |
 
 ---
 
