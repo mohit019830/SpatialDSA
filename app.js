@@ -115,6 +115,7 @@
     ROTATE: 'ROTATE',
     ZOOM: 'ZOOM',
     LINK: 'LINK',
+    LASER: 'LASER',            // mouse-driven "draw & shoot" edge laser
   };
 
   // Ghost-node guard: never spawn within this of an existing node.
@@ -125,6 +126,17 @@
     dragTarget: null,          // uuid of the node locked for dragging
     lastCursor: null,          // {x,y} last normalized cursor (for rotate deltas)
     linkFrom: null,            // uuid of Node A while a link line is being drawn
+  };
+
+  /* -------------------------------------------------------------------------
+   * Mouse "Draw & Shoot" laser state. Kept separate from `gesture` so the two
+   * input methods never share mutable fields. `active` is only true between a
+   * mousedown-on-node and its mouseup.
+   * ---------------------------------------------------------------------- */
+  const mouse = {
+    active: false,
+    from: null,                // uuid of the locked Source Node
+    snapTo: null,              // uuid the laser is currently magnet-locked to
   };
 
   /* =========================================================================
@@ -637,6 +649,89 @@
   }
 
   /* =========================================================================
+   * MOUSE "DRAW & SHOOT" LASER (fallback that mirrors the vision link gesture)
+   * -------------------------------------------------------------------------
+   *   mousedown on a node  → lock it as the Source Node, start the beam.
+   *   mousemove (held)     → stretch the beam to the cursor; auto-aim magnetism
+   *                          snaps the tip to any node within 2.0 units.
+   *   mouseup              → snapped ? commit the edge : destroy the beam.
+   *
+   * A vision gesture always wins: if the hands are mid-pinch/rotate/zoom/link,
+   * the mouse path stays inert so the two inputs never fight over the beam.
+   * ====================================================================== */
+  function visionOwnsFrame() {
+    return gesture.mode === MODE.DRAG_NODE ||
+           gesture.mode === MODE.ROTATE ||
+           gesture.mode === MODE.ZOOM ||
+           gesture.mode === MODE.LINK;
+  }
+
+  function wireMouse() {
+    const canvas = els.scene;
+
+    canvas.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;              // left button only
+      if (!renderer || visionOwnsFrame()) return;
+
+      const { hovered } = renderer.raycastScreen(e.clientX, e.clientY);
+      if (!hovered) return;                    // must start ON a node
+
+      if (renderer.beginLink(hovered)) {
+        mouse.active = true;
+        mouse.from = hovered;
+        mouse.snapTo = null;
+        setMode('LASER');
+      }
+    });
+
+    canvas.addEventListener('mousemove', (e) => {
+      if (!mouse.active || !renderer) return;
+
+      const { worldPoint } = renderer.raycastScreen(e.clientX, e.clientY);
+      if (!worldPoint) return;
+
+      // Auto-aim: is the tip inside a node's magnet radius?
+      const target = renderer.magnetTarget(mouse.from, worldPoint);
+      if (target) {
+        mouse.snapTo = target;
+        renderer.snapLinkTo(target);           // pin + locked-green glow
+      } else {
+        mouse.snapTo = null;
+        renderer.updateLink(worldPoint);       // free-flying aiming beam
+      }
+    });
+
+    // Commit (or discard) on release. Listen on window so a mouseup that lands
+    // outside the canvas still resolves the beam.
+    window.addEventListener('mouseup', (e) => {
+      if (!mouse.active) return;
+      if (e.button !== 0) return;
+
+      if (mouse.snapTo && mouse.snapTo !== mouse.from) {
+        // Magnetically locked onto Node B → permanently commit the edge.
+        engine.addEdge(mouse.from, mouse.snapTo, { directed: true, weight: 1 });
+      }
+      // Whether committed (solidified via setModel) or released in open air,
+      // tear the temporary beam down.
+      renderer.endLink();
+      mouse.active = false;
+      mouse.from = null;
+      mouse.snapTo = null;
+      setMode('IDLE');
+    });
+
+    // Losing the window (alt-tab, drag-off) should never leave a beam stuck on.
+    window.addEventListener('blur', () => {
+      if (!mouse.active) return;
+      renderer.endLink();
+      mouse.active = false;
+      mouse.from = null;
+      mouse.snapTo = null;
+      setMode('IDLE');
+    });
+  }
+
+  /* =========================================================================
    * Demo data — seeds a structure appropriate to the active algorithm.
    * ====================================================================== */
   function seedDemoData() {
@@ -682,6 +777,7 @@
 
   async function boot() {
     wireControls();
+    wireMouse();
 
     // 1. 3D engine (required). Fail loudly if THREE / Renderer3D missing.
     if (!window.Render3D) {

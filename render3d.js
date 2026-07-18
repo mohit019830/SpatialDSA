@@ -256,20 +256,32 @@
         'position',
         new THREE.BufferAttribute(new Float32Array(6), 3)
       );
-      this._linkLine = new THREE.Line(
-        linkGeo,
-        new THREE.LineBasicMaterial({
-          color: 0x00ff9c,
-          transparent: true,
-          opacity: 0.9,
-          blending: THREE.AdditiveBlending,
-          depthWrite: false,
-        })
-      );
+      // Two materials swapped by reference (never mutated): a cyan "aiming"
+      // beam while the tip is in open air, and a hot-green "locked" beam once
+      // auto-aim magnetism snaps the tip onto a target node.
+      this._linkAimMat = new THREE.LineBasicMaterial({
+        color: 0x00f3ff,
+        transparent: true,
+        opacity: 0.75,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      });
+      this._linkLockMat = new THREE.LineBasicMaterial({
+        color: 0x00ff9c,
+        transparent: true,
+        opacity: 1.0,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      });
+      this._linkLine = new THREE.Line(linkGeo, this._linkAimMat);
       this._linkLine.visible = false;
       this._linkLine.frustumCulled = false;   // endpoints move every frame
       this._linkFrom = null;
       this.field.add(this._linkLine);          // lives in field space
+
+      // Auto-aim magnetism radius (field-local units). When the laser tip comes
+      // within this of another node's center, the beam snaps to that node.
+      this.MAGNET_RADIUS = 2.0;
 
       // --- Reusable temporaries (avoid per-frame allocations) ------------
       this._tmpVec3 = new THREE.Vector3();
@@ -665,6 +677,7 @@
       pos.setXYZ(0, group.position.x, group.position.y, group.position.z);
       pos.setXYZ(1, group.position.x, group.position.y, group.position.z);
       pos.needsUpdate = true;
+      this._linkLine.material = this._linkAimMat;   // start in "aiming" state
       this._linkLine.visible = true;
       return true;
     }
@@ -677,11 +690,86 @@
       if (group) pos.setXYZ(0, group.position.x, group.position.y, group.position.z);
       pos.setXYZ(1, localPoint.x, localPoint.y, localPoint.z);
       pos.needsUpdate = true;
+      // Free-flying tip → aiming beam (magnetism, if any, is applied by the
+      // caller via snapLinkTo before/after this).
+      this._linkLine.material = this._linkAimMat;
     }
 
     endLink() {
       this._linkLine.visible = false;
       this._linkFrom = null;
+    }
+
+    /* ---------------------------------------------------------------------
+     * MOUSE FALLBACK SUPPORT ("Draw & Shoot" laser).
+     * These mirror the vision path exactly but take raw pixel coordinates.
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Cast a ray from a pixel coordinate (clientX/clientY, e.g. a MouseEvent)
+     * through the scene. Returns { hovered, worldPoint } where worldPoint is
+     * FIELD-LOCAL (matching updateCursor), so it can feed beginLink/updateLink,
+     * moveNode, or magnetTarget without any extra conversion.
+     */
+    raycastScreen(clientX, clientY) {
+      const rect = this.canvas.getBoundingClientRect();
+      // Guard against a zero-size canvas (not yet laid out).
+      if (!rect.width || !rect.height) return { hovered: null, worldPoint: null };
+
+      const nx = (clientX - rect.left) / rect.width;
+      const ny = (clientY - rect.top) / rect.height;
+      this.pointerNDC.x = nx * 2 - 1;
+      this.pointerNDC.y = -(ny * 2 - 1);
+      this.raycaster.setFromCamera(this.pointerNDC, this.camera);
+
+      // World point on the z=0 work plane, then converted to field-local so it
+      // stays correct while the field is rotated.
+      const worldPoint = this._lastWorldPoint;
+      this.raycaster.ray.intersectPlane(this.workPlane, worldPoint);
+      const localPoint = this.field.worldToLocal(worldPoint.clone());
+
+      const hovered = this._hoverTest(worldPoint);
+      return { hovered, worldPoint: localPoint };
+    }
+
+    /**
+     * AUTO-AIM MAGNETISM. Given the source node and the laser tip in FIELD-LOCAL
+     * space, return the uuid of the nearest OTHER node whose center is within
+     * MAGNET_RADIUS of the tip, or null. Nearest wins when several qualify.
+     */
+    magnetTarget(fromUuid, tipLocalPoint) {
+      if (!tipLocalPoint) return null;
+      const r2 = this.MAGNET_RADIUS * this.MAGNET_RADIUS;
+      let best = null;
+      let bestD2 = r2;
+      for (const [uuid, group] of this.nodeMeshes) {
+        if (uuid === fromUuid) continue;         // never snap back to the source
+        const p = group.position;                // field-local, same space as tip
+        const dx = p.x - tipLocalPoint.x;
+        const dy = p.y - tipLocalPoint.y;
+        const dz = p.z - tipLocalPoint.z;
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 <= bestD2) { bestD2 = d2; best = uuid; }
+      }
+      return best;
+    }
+
+    /**
+     * Pin the laser's free vertex exactly onto a node's center and switch the
+     * beam to the hot-green "locked" material. Returns false if the target or
+     * source mesh is gone.
+     */
+    snapLinkTo(uuid) {
+      if (!this._linkLine.visible) return false;
+      const target = this.nodeMeshes.get(uuid);
+      const from = this.nodeMeshes.get(this._linkFrom);
+      if (!target) return false;
+      const pos = this._linkLine.geometry.attributes.position;
+      if (from) pos.setXYZ(0, from.position.x, from.position.y, from.position.z);
+      pos.setXYZ(1, target.position.x, target.position.y, target.position.z);
+      pos.needsUpdate = true;
+      this._linkLine.material = this._linkLockMat;  // locked-on glow
+      return true;
     }
 
     /* ---------------------------------------------------------------------
