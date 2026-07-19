@@ -285,7 +285,9 @@
 
     // Recursion visualizer: hand the current step's call-frame snapshot to the
     // renderer. Null frames (non-recursive steps / idle) simply clear it.
-    if (renderer && recursionMode) renderer.renderFrame(state.frame || null);
+    if (renderer && recursionMode) {
+      renderer.renderFrame(state.frame || null, state.stepIndex);
+    }
 
     // Heavy code-panel rebuild: gated on line/algorithm change only.
     if (state.lineIndex !== _lastRenderedLine || state.algorithm !== _lastRenderedAlgo) {

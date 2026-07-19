@@ -149,13 +149,16 @@
     // Activation-node box (call tree) + flat slab (stack tower). Materials
     // keyed by call-state so a frame swap is a reference change, no alloc.
     SHARED.recNodeGeo = new THREE.BoxGeometry(2.6, 1.3, 0.5);
-    SHARED.recBlockGeo = new THREE.BoxGeometry(4.6, 1.3, 0.4);
+    // A taller block for the stack tower so a multi-line frame face (signature +
+    // args + locals + return slot) is legible.
+    SHARED.recBlockGeo = new THREE.BoxGeometry(5.4, 2.6, 0.8);
     const REC_STATE_COLOR = {
       active:   0x00f3ff, // the frame entered this step
       onstack:  0x2aa9c9, // still on the call stack (ancestor)
-      return:   0x00ff9c, // returning this step
+      return:   0x00ff9c, // returning this step (neon green = resolved)
       returned: 0xbd00ff, // finished / popped
     };
+    SHARED.recStateColor = REC_STATE_COLOR;
     SHARED.recNodeMat = {};
     for (const k of Object.keys(REC_STATE_COLOR)) {
       const color = REC_STATE_COLOR[k];
@@ -167,6 +170,28 @@
         opacity: k === 'returned' ? 0.55 : 0.9,
       });
     }
+    // Glass-morphic stack-block materials: high transmission, low opacity, a
+    // soft emissive rim keyed by call-state. MeshPhysicalMaterial gives real
+    // refraction so the tower reads like stacked glass slabs.
+    SHARED.recGlassMat = {};
+    for (const k of Object.keys(REC_STATE_COLOR)) {
+      const color = REC_STATE_COLOR[k];
+      SHARED.recGlassMat[k] = new THREE.MeshPhysicalMaterial({
+        color,
+        emissive: color,
+        emissiveIntensity: k === 'active' || k === 'return' ? 0.55 : 0.22,
+        metalness: 0.0,
+        roughness: 0.12,
+        transmission: 0.9,
+        thickness: 0.8,
+        ior: 1.35,
+        clearcoat: 1.0,
+        clearcoatRoughness: 0.15,
+        transparent: true,
+        opacity: 0.42,
+        depthWrite: false,
+      });
+    }
     SHARED.recLinkMat = {
       idle: new THREE.LineBasicMaterial({
         color: 0x2f6d7a, transparent: true, opacity: 0.5, depthWrite: false,
@@ -174,6 +199,15 @@
       active: new THREE.LineBasicMaterial({
         color: 0x00f3ff, transparent: true, opacity: 0.95,
         blending: THREE.AdditiveBlending, depthWrite: false,
+      }),
+    };
+    // Small cone arrowhead marking edge direction (parent → child).
+    SHARED.recArrowGeo = new THREE.ConeGeometry(0.28, 0.7, 10);
+    SHARED.recArrowMat = {
+      idle: new THREE.MeshBasicMaterial({ color: 0x2f6d7a, transparent: true, opacity: 0.6 }),
+      active: new THREE.MeshBasicMaterial({
+        color: 0x00f3ff, transparent: true, opacity: 0.95,
+        blending: THREE.AdditiveBlending,
       }),
     };
 
@@ -1219,21 +1253,44 @@
       this.camera.add(this._recStackGroup);
       // Ensure the camera is in the scene graph so its child renders.
       if (!this.camera.parent) this.scene.add(this.camera);
-      // Park the tower in the lower-right of the view, a fixed distance ahead.
-      this._recStackGroup.position.set(9.5, -5.5, -22);
+      // Park the tower toward the right of the view, a fixed distance ahead.
+      // `_recStackBaseY` is the resting y of the tower's foot; deep-recursion
+      // fit slides/scales the group around this base.
+      this._recStackBasePos = new THREE.Vector3(8.5, -8.0, -22);
+      this._recStackGroup.position.copy(this._recStackBasePos);
+      this._recStackFitScale = 1;    // lerp target for deep-recursion scaling
+      this._recStackFitY = 0;        // lerp target extra y-shift
 
       // Pools (grown on demand, hidden when unused — never freed).
       this._recNodePool = [];   // activation-node meshes for the tree
       this._recLinkPool = [];   // parent→child lines for the tree
+      this._recArrowPool = [];  // directed-edge arrowheads for the tree
       this._recBlockPool = [];  // stack-frame blocks for the tower
+
+      // Single return-value bubble sprite (travels an edge on return). Pooled
+      // as one because only one return resolves per step.
+      this._recBubble = new THREE.Sprite(
+        new THREE.SpriteMaterial({ transparent: true, depthWrite: false, depthTest: false })
+      );
+      this._recBubble.scale.set(2.4, 1.2, 1);
+      this._recBubble.visible = false;
+      this._recTreeGroup.add(this._recBubble);
+      this._recBubbleAnim = null;    // {fromX,fromY,toX,toY,text,start,dur}
+
+      // Transient stack flourish (push slide-in / pop slide-off ghost).
+      this._recStackAnim = null;     // {kind:'push'|'pop', start, dur, ...}
 
       this._recActive = false;
       this._recMode = 'tree';   // 'tree' | 'stack'
+      this._recLastStepIndex = -1;
+      this._recPrevFrame = null;
 
       // Layout constants.
       this.REC_X_SPACING = 3.4;
       this.REC_Y_SPACING = 4.2;
-      this.REC_BLOCK_H = 1.6;   // stack block height + gap
+      this.REC_BLOCK_H = 2.9;   // stack block height + gap (block geo is 2.6)
+      this.REC_TREE_TOP_Y = 8;  // y of the root row before fit-scaling
+      this.REC_ANIM_MS = 520;   // flourish duration
     }
 
     /**
@@ -1259,20 +1316,28 @@
       return group;
     }
 
-    /** A stack-frame block for the tower (flat translucent slab + label). */
+    /**
+     * A stack-frame block for the tower: a glass-morphic BoxGeometry with a
+     * multi-line face plane (signature + args + locals + return slot) sitting on
+     * the +z face so it reads head-on. Pooled.
+     */
     _makeRecBlock() {
       const group = new THREE.Group();
-      const slab = new THREE.Mesh(SHARED.recBlockGeo, SHARED.recNodeMat.active.clone());
-      group.add(slab);
-      group.userData.slab = slab;
+      const box = new THREE.Mesh(SHARED.recBlockGeo, SHARED.recGlassMat.active.clone());
+      group.add(box);
+      group.userData.box = box;
 
-      const sprite = new THREE.Sprite(
-        new THREE.SpriteMaterial({ transparent: true, depthWrite: false, depthTest: false })
+      // Face plane carries the multi-line canvas texture, parked just proud of
+      // the block's front (+z) face.
+      const face = new THREE.Mesh(
+        new THREE.PlaneGeometry(5.0, 2.3),
+        new THREE.MeshBasicMaterial({
+          transparent: true, depthWrite: false, opacity: 0.98,
+        })
       );
-      sprite.scale.set(4.2, 1.2, 1);
-      sprite.position.set(0, 0, 0.3);
-      group.add(sprite);
-      group.userData.sprite = sprite;
+      face.position.set(0, 0, 0.42);
+      group.add(face);
+      group.userData.face = face;
       group.userData.labelKey = null;
       group.visible = false;
       this._recStackGroup.add(group);
@@ -1290,7 +1355,15 @@
       return line;
     }
 
-    /** Canvas label texture for recursion nodes, cached by text. */
+    /** A cone arrowhead marking edge direction (parent → child). Pooled. */
+    _makeRecArrow() {
+      const arrow = new THREE.Mesh(SHARED.recArrowGeo, SHARED.recArrowMat.idle);
+      arrow.visible = false;
+      this._recTreeGroup.add(arrow);
+      return arrow;
+    }
+
+    /** Canvas label texture for recursion tree nodes, cached by text. */
     _recLabelTexture(text) {
       if (!this._recLabelCache) this._recLabelCache = new Map();
       if (this._recLabelCache.has(text)) return this._recLabelCache.get(text);
@@ -1314,12 +1387,89 @@
       return tex;
     }
 
-    /** Set a pooled group's label sprite, reusing cached textures. */
+    /**
+     * Multi-line stack-frame face texture: function signature, arguments, local
+     * variables, and a return slot — the "OS stack frame" teaching abstraction.
+     * Cached by a composite key so repeated faces reuse one canvas.
+     */
+    _recBlockTexture(f, accent) {
+      if (!this._recBlockCache) this._recBlockCache = new Map();
+      const argStr = (f.args || []).map((a) => `${a.name}=${a.value}`).join(', ');
+      const localStr = (f.locals || []).map((l) => `${l.name}=${l.value}`).join('  ');
+      const retStr = f.result !== null && f.result !== undefined ? String(f.result) : '·';
+      const key = `${accent}|${f.label}|${argStr}|${localStr}|${retStr}`;
+      if (this._recBlockCache.has(key)) return this._recBlockCache.get(key);
+
+      const w = 512, h = 240;
+      const cvs = document.createElement('canvas');
+      cvs.width = w; cvs.height = h;
+      const ctx = cvs.getContext('2d');
+      ctx.clearRect(0, 0, w, h);
+
+      // Panel backdrop for legibility over the transparent glass block.
+      ctx.fillStyle = 'rgba(6, 20, 28, 0.55)';
+      this._roundRect(ctx, 6, 6, w - 12, h - 12, 16);
+      ctx.fill();
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = accent;
+      ctx.stroke();
+
+      ctx.textBaseline = 'middle';
+      // Signature (function + params).
+      ctx.textAlign = 'left';
+      ctx.font = 'bold 40px "Consolas", "SFMono-Regular", monospace';
+      ctx.fillStyle = '#eafcff';
+      ctx.fillText(f.label, 28, 46);
+
+      // Args line.
+      ctx.font = '26px "Consolas", monospace';
+      ctx.fillStyle = '#9fe8ff';
+      ctx.fillText(`args: ${argStr || '—'}`, 28, 96);
+
+      // Locals line(s).
+      ctx.fillStyle = '#c9b8ff';
+      ctx.fillText(`local: ${localStr || '—'}`, 28, 138);
+
+      // Return slot.
+      ctx.font = 'bold 30px "Consolas", monospace';
+      ctx.fillStyle = accent;
+      ctx.fillText(`return: ${retStr}`, 28, 190);
+
+      const tex = new THREE.CanvasTexture(cvs);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.anisotropy = 4;
+      tex.needsUpdate = true;
+      this._recBlockCache.set(key, tex);
+      return tex;
+    }
+
+    /** Rounded-rect path helper for canvas faces. */
+    _roundRect(ctx, x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+      ctx.closePath();
+    }
+
+    /** Set a pooled tree node's label sprite, reusing cached textures. */
     _recSetLabel(group, text) {
       if (group.userData.labelKey === text) return;
       group.userData.sprite.material.map = this._recLabelTexture(text);
       group.userData.sprite.material.needsUpdate = true;
       group.userData.labelKey = text;
+    }
+
+    /** Set a pooled stack block's multi-line face texture. */
+    _recSetBlockFace(group, f, accentHex) {
+      const key = `${accentHex}|${f.label}|${(f.args || []).map((a) => a.name + a.value).join()}` +
+        `|${(f.locals || []).map((l) => l.name + l.value).join()}|${f.result}`;
+      if (group.userData.labelKey === key) return;
+      group.userData.face.material.map = this._recBlockTexture(f, accentHex);
+      group.userData.face.material.needsUpdate = true;
+      group.userData.labelKey = key;
     }
 
     /**
@@ -1330,6 +1480,11 @@
       if (!this._recTreeGroup) this._buildRecursion();
       this._recActive = true;
       this._recMode = mode === 'stack' ? 'stack' : 'tree';
+      // Fresh entry: no prior frame, so the first render plays no flourish.
+      this._recLastStepIndex = -1;
+      this._recPrevFrame = null;
+      this._recBubbleAnim = null;
+      this._recStackAnim = null;
 
       for (const g of this.nodeMeshes.values()) g.visible = false;
       for (const g of this.edgeMeshes.values()) g.visible = false;
@@ -1356,8 +1511,14 @@
       const treeOn = this._recMode === 'tree';
       this._recTreeGroup.visible = treeOn;
       this._recStackGroup.visible = !treeOn;
-      // Re-render the last frame into the now-visible view.
-      if (this._recLastFrame) this.renderFrame(this._recLastFrame);
+      // Re-render the last frame into the now-visible view (no flourish: a view
+      // toggle is not a trace step).
+      if (this._recLastFrame) {
+        this._recBubbleAnim = null;
+        this._recStackAnim = null;
+        if (treeOn) this._renderCallTree(this._recLastFrame);
+        else this._renderStackTower(this._recLastFrame);
+      }
     }
 
     /** Leave recursion mode and restore the data-structure layer. */
@@ -1371,21 +1532,78 @@
     }
 
     /**
-     * Render a single call-frame snapshot (from the engine). Idempotent and
-     * order-independent, so trace back/forward/jump all work by simply handing
-     * the current step's `frame` here. A null frame clears both views.
+     * Render a single call-frame snapshot (from the engine). The snapshot is the
+     * authoritative state: it is applied instantly and idempotently, so trace
+     * back/forward/jump all work by simply handing the current step's `frame`
+     * here. `stepIndex` (optional) lets the renderer derive the step DIRECTION
+     * and fire the matching transient flourish (bubble travel, block slide) —
+     * animations never hold state, they only decorate the transition.
      */
-    renderFrame(frame) {
+    renderFrame(frame, stepIndex) {
       if (!this._recTreeGroup) this._buildRecursion();
+
+      // Derive step direction + transition events for flourishes.
+      const idx = typeof stepIndex === 'number' ? stepIndex : this._recLastStepIndex + 1;
+      const dir = this._recLastStepIndex < 0 ? 0 : Math.sign(idx - this._recLastStepIndex);
+      const prev = this._recPrevFrame;
+
       this._recLastFrame = frame || null;
+
       if (!frame) {
         this._recNodePool.forEach((g) => (g.visible = false));
         this._recLinkPool.forEach((l) => (l.visible = false));
+        this._recArrowPool.forEach((a) => (a.visible = false));
         this._recBlockPool.forEach((b) => (b.visible = false));
+        this._recBubble.visible = false;
+        this._recBubbleAnim = null;
+        this._recStackAnim = null;
+        this._recPrevFrame = null;
+        this._recLastStepIndex = idx;
         return;
       }
+
+      // A new step interrupts any in-flight flourish (snap to end); the fresh
+      // flourish is scheduled below from the diff + direction.
+      this._recScheduleFlourish(frame, prev, dir);
+
       if (this._recMode === 'tree') this._renderCallTree(frame);
       else this._renderStackTower(frame);
+
+      this._recPrevFrame = frame;
+      this._recLastStepIndex = idx;
+    }
+
+    /**
+     * Decide which transient flourish (if any) accompanies the transition into
+     * `frame` from `prev`, given step `dir`. Forward over a return → bubble up +
+     * pop slide-off; backward over a return → bubble down + push slide-on;
+     * forward over a callEnter → push slide-in; backward over a callEnter → pop.
+     */
+    _recScheduleFlourish(frame, prev, dir) {
+      this._recBubbleAnim = null;
+      this._recStackAnim = null;
+      if (!dir) return;                    // first paint, no transition
+
+      const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+      const dur = this.REC_ANIM_MS;
+
+      // Forward INTO a return frame: the activeId frame just resolved.
+      if (dir > 0 && frame.event === 'return') {
+        this._recBubbleAnim = { node: frame.activeId, value: frame.returnValue, up: true, start: now, dur };
+        this._recStackAnim = { kind: 'pop', frame: this._recFindNode(frame, frame.activeId), start: now, dur };
+      } else if (dir < 0 && prev && prev.event === 'return') {
+        // Backward, undoing a return: value travels back down, block slides on.
+        this._recBubbleAnim = { node: prev.activeId, value: prev.returnValue, up: false, start: now, dur };
+        this._recStackAnim = { kind: 'unpop', frame: this._recFindNode(prev, prev.activeId), start: now, dur };
+      } else if (dir > 0 && frame.event === 'callEnter') {
+        this._recStackAnim = { kind: 'push', start: now, dur };
+      } else if (dir < 0 && prev && prev.event === 'callEnter') {
+        this._recStackAnim = { kind: 'unpush', frame: this._recFindNode(prev, prev.activeId), start: now, dur };
+      }
+    }
+
+    _recFindNode(frame, id) {
+      return frame.nodes.find((n) => n.id === id) || null;
     }
 
     /* Lay the call tree out by depth (y) and sibling order (x). We compute a
@@ -1397,7 +1615,11 @@
       const perDepth = new Map();      // depth -> count so far
       const slot = new Map();          // id -> slot index
       const depthCount = new Map();    // depth -> total at that depth
-      for (const n of nodes) depthCount.set(n.depth, (depthCount.get(n.depth) || 0) + 1);
+      let maxDepth = 0;
+      for (const n of nodes) {
+        depthCount.set(n.depth, (depthCount.get(n.depth) || 0) + 1);
+        if (n.depth > maxDepth) maxDepth = n.depth;
+      }
       for (const n of nodes) {
         const s = perDepth.get(n.depth) || 0;
         slot.set(n.id, s);
@@ -1405,16 +1627,26 @@
       }
 
       const pos = new Map();           // id -> {x,y}
+      let maxRow = 1;
       for (const n of nodes) {
         const total = depthCount.get(n.depth);
+        if (total > maxRow) maxRow = total;
         const s = slot.get(n.id);
         const x = (s - (total - 1) / 2) * this.REC_X_SPACING;
-        const y = 8 - n.depth * this.REC_Y_SPACING;
+        const y = this.REC_TREE_TOP_Y - n.depth * this.REC_Y_SPACING;
         pos.set(n.id, { x, y });
       }
+      this._recTreePos = pos;          // stash for bubble animation
 
-      // Draw links first (parent→child), then nodes on top.
-      let li = 0;
+      // Depth-aware fit: scale the tree group so the whole graph stays framed.
+      // Visible half-extents at the parked camera (z=40) are ~ ±20 x / ±14 y.
+      const treeW = maxRow * this.REC_X_SPACING;
+      const treeH = (maxDepth + 1) * this.REC_Y_SPACING;
+      const fit = Math.min(1, 38 / Math.max(treeW, 1), 26 / Math.max(treeH, 1));
+      this._recTreeFitScale = fit;
+
+      // Draw links + arrowheads first (parent→child), then nodes on top.
+      let li = 0, ai = 0;
       for (const n of nodes) {
         if (n.parentId === null || n.parentId === undefined) continue;
         const p = pos.get(n.parentId);
@@ -1426,13 +1658,26 @@
         attr.setXYZ(0, p.x, p.y, 0);
         attr.setXYZ(1, c.x, c.y, 0);
         attr.needsUpdate = true;
-        // A link on the active path (child is the active frame or on the stack)
-        // glows; finished branches dim.
+        // A link on the active path (child on the stack) glows; else dims.
         const onStack = frame.stack.some((f) => f.id === n.id);
         line.material = onStack ? SHARED.recLinkMat.active : SHARED.recLinkMat.idle;
         line.visible = true;
+
+        // Arrowhead: sit near the child end, pointing parent→child.
+        const arrow = this._recArrowPool[ai] || (this._recArrowPool[ai] = this._makeRecArrow());
+        ai++;
+        const dx = c.x - p.x, dy = c.y - p.y;
+        const len = Math.hypot(dx, dy) || 1;
+        const ux = dx / len, uy = dy / len;
+        // Park the cone short of the child box (box half-height ≈ 0.65).
+        arrow.position.set(c.x - ux * 1.15, c.y - uy * 1.15, 0);
+        // Cone points +y by default; rotate to align with (ux,uy).
+        arrow.rotation.z = Math.atan2(uy, ux) - Math.PI / 2;
+        arrow.material = onStack ? SHARED.recArrowMat.active : SHARED.recArrowMat.idle;
+        arrow.visible = true;
       }
       for (; li < this._recLinkPool.length; li++) this._recLinkPool[li].visible = false;
+      for (; ai < this._recArrowPool.length; ai++) this._recArrowPool[ai].visible = false;
 
       // Nodes.
       let ni = 0;
@@ -1445,38 +1690,207 @@
           ? `${n.label}=${n.result}`
           : n.label;
         this._recSetLabel(g, label);
-        // Color: the active frame is neon; on-stack ancestors are cyan; returned
-        // frames go purple (done); everything else default.
-        let matKey = 'returned';
-        if (n.id === frame.activeId) matKey = frame.event === 'return' ? 'return' : 'active';
+        // Color: the frame returning THIS step goes neon-green (resolved); the
+        // active frame is cyan; on-stack ancestors dim-cyan; other returned
+        // frames purple.
+        let matKey;
+        if (n.id === frame.activeId && frame.event === 'return') matKey = 'return';
+        else if (n.id === frame.activeId) matKey = 'active';
         else if (frame.stack.some((f) => f.id === n.id)) matKey = 'onstack';
-        else if (n.status === 'active') matKey = 'onstack';
+        else if (n.status === 'returned') matKey = 'returned';
+        else matKey = 'onstack';
         g.userData.box.material = SHARED.recNodeMat[matKey] || SHARED.recNodeMat.active;
         g.visible = true;
       }
       for (; ni < this._recNodePool.length; ni++) this._recNodePool[ni].visible = false;
+
+      // Prime the return bubble endpoints now that positions are known.
+      const ba = this._recBubbleAnim;
+      if (ba) {
+        const child = pos.get(ba.node);
+        const nodeObj = this._recFindNode(frame, ba.node);
+        const parent = nodeObj ? pos.get(nodeObj.parentId) : null;
+        if (child && parent) {
+          ba.fromX = ba.up ? child.x : parent.x;
+          ba.fromY = ba.up ? child.y : parent.y;
+          ba.toX = ba.up ? parent.x : child.x;
+          ba.toY = ba.up ? parent.y : child.y;
+        } else {
+          this._recBubbleAnim = null;   // endpoints missing (shouldn't happen)
+        }
+      }
     }
 
-    /* Render the live call stack as a tower of blocks growing upward. The
-     * active (top) frame is highlighted; a `return` event tints the top block
-     * so the pop reads clearly before it disappears next step. */
+    /* Render the live call stack as a tower of glass blocks growing upward.
+     * The top (active) frame is highlighted; a return step flashes and the
+     * returning frame slides off as a transient ghost (see _updateRecursion).
+     * Each block face shows signature + args + locals + return slot. */
     _renderStackTower(frame) {
       const stack = frame.stack;
+      const H = this.REC_BLOCK_H;
       let bi = 0;
       for (let i = 0; i < stack.length; i++) {
         const f = stack[i];
         const b = this._recBlockPool[bi] || (this._recBlockPool[bi] = this._makeRecBlock());
         bi++;
-        // Bottom of stack at the lowest y, growing up.
-        b.position.set(0, i * this.REC_BLOCK_H, 0);
-        this._recSetLabel(b, f.label);
+        b.position.set(0, i * H, 0);
         const isTop = i === stack.length - 1;
-        let matKey = 'onstack';
-        if (isTop) matKey = frame.event === 'return' ? 'return' : 'active';
-        b.userData.slab.material = SHARED.recNodeMat[matKey] || SHARED.recNodeMat.active;
+        const matKey = isTop ? 'active' : 'onstack';
+        // Recolor the block's OWN cloned material (never point at the shared
+        // one) so per-block opacity/flash animation can't bleed across blocks.
+        this._recApplyBlockState(b, matKey);
+        this._recSetBlockFace(b, f, this._recAccentHex(matKey));
+        b.userData.restY = i * H;
+        b.userData.slotTop = isTop;
+        b.userData.matKey = matKey;
         b.visible = true;
       }
       for (; bi < this._recBlockPool.length; bi++) this._recBlockPool[bi].visible = false;
+
+      // Deep-recursion fit: if the tower is taller than the visible band, scale
+      // it down and shift so the top stays in view. Lerped in _updateRecursion.
+      const towerH = Math.max(stack.length, 1) * H;
+      const VISIBLE_H = 20;
+      this._recStackFitScale = Math.min(1, VISIBLE_H / towerH);
+      this._recStackFitY = 0;
+
+      // The pop/unpop ghost block reuses one dedicated slot beyond the live set.
+      this._recGhostSlotY = stack.length * H;
+    }
+
+    _recAccentHex(matKey) {
+      const c = (SHARED.recStateColor && SHARED.recStateColor[matKey]) || 0x00f3ff;
+      return '#' + c.toString(16).padStart(6, '0');
+    }
+
+    /**
+     * Per-frame recursion animation tick. Eases the depth-aware fit (tree scale,
+     * tower scale + shift so the top stays in view) and drives the two transient
+     * flourishes (return-value bubble travelling an edge; stack push/pop slide).
+     * All flourishes are time-boxed and self-clearing — state lives in the
+     * snapshot, never here.
+     */
+    _updateRecursion(t) {
+      const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+      const LERP = 0.12;
+      const easeInOut = (u) => (u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2);
+
+      // --- Tree: ease group scale toward the depth-aware fit ---------------
+      if (this._recMode === 'tree' && this._recTreeFitScale) {
+        const cur = this._recTreeGroup.scale.x;
+        const s = cur + (this._recTreeFitScale - cur) * LERP;
+        this._recTreeGroup.scale.setScalar(s);
+
+        // Return-value bubble travel along the parent↔child edge.
+        const ba = this._recBubbleAnim;
+        if (ba && ba.fromX !== undefined) {
+          const u = Math.min(1, (now - ba.start) / ba.dur);
+          const e = easeInOut(u);
+          this._recBubble.position.set(
+            ba.fromX + (ba.toX - ba.fromX) * e,
+            ba.fromY + (ba.toY - ba.fromY) * e,
+            0.6
+          );
+          this._recSetBubble(ba.value);
+          this._recBubble.visible = true;
+          if (u >= 1) { this._recBubbleAnim = null; this._recBubble.visible = false; }
+        } else if (!ba) {
+          this._recBubble.visible = false;
+        }
+      } else {
+        this._recBubble.visible = false;
+      }
+
+      // --- Stack: ease group scale/shift so the top stays framed ----------
+      if (this._recMode === 'stack') {
+        const g = this._recStackGroup;
+        const targetS = this._recStackFitScale || 1;
+        const s = g.scale.x + (targetS - g.scale.x) * LERP;
+        g.scale.setScalar(s);
+        // Keep the tower foot anchored at its base; scaling shrinks upward.
+        const by = this._recStackBasePos.y + (this._recStackFitY || 0);
+        g.position.y += (by - g.position.y) * LERP;
+
+        // Push / pop slide flourish. The snapshot has already been applied by
+        // _renderStackTower — the top block is at its rest slot. We only nudge
+        // that block's transform/opacity for the duration of the flourish, then
+        // let it settle. (The popped/pushed frame IS the current top block: on a
+        // forward return the returning frame has left the stack, so its ghost is
+        // synthesised from the pool slot just above; on push the new top is the
+        // arrival.)
+        const sa = this._recStackAnim;
+        const top = this._recTopBlock();
+        if (sa && top) {
+          const u = Math.min(1, (now - sa.start) / sa.dur);
+          const e = easeInOut(u);
+          const H = this.REC_BLOCK_H;
+          const restY = top.userData.restY || 0;
+
+          if (sa.kind === 'push') {
+            // New top arrives: rise into its slot from one block-height below.
+            top.position.y = restY - (1 - e) * H;
+            this._recSetBlockOpacity(top, e);
+          } else if (sa.kind === 'unpush') {
+            // Reverse of push: sink out below its slot + fade.
+            top.position.y = restY - e * H;
+            this._recSetBlockOpacity(top, 1 - e);
+          } else if (sa.kind === 'pop' || sa.kind === 'unpop') {
+            // Flash the current top (the frame beneath the one that left/returns)
+            // to signal a return value was generated, then hold position.
+            const f = 0.5 + 0.5 * Math.sin(u * Math.PI * 4);
+            this._recSetBlockEmissive(top, 0.55 + f * 0.7);
+            this._recSetBlockOpacity(top, 1);
+            top.position.y = restY;
+          }
+          if (u >= 1) {
+            // Settle: rest position, full opacity, base emissive.
+            top.position.y = restY;
+            this._recSetBlockOpacity(top, 1);
+            this._recSetBlockEmissive(top, top.userData.matKey === 'onstack' ? 0.22 : 0.55);
+            this._recStackAnim = null;
+          }
+        } else if (!sa && top) {
+          // Idle: ensure the top block sits settled (guards against a flourish
+          // that was interrupted mid-way by a fast scrub).
+          this._recSetBlockOpacity(top, 1);
+        }
+      }
+    }
+
+    /** Recolor a block to a call-state, animating on its OWN cloned material. */
+    _recApplyBlockState(block, matKey) {
+      const src = SHARED.recGlassMat[matKey] || SHARED.recGlassMat.active;
+      const m = block.userData.box.material;
+      m.color.copy(src.color);
+      m.emissive.copy(src.emissive);
+      m.emissiveIntensity = src.emissiveIntensity;
+      m.opacity = src.opacity;
+    }
+
+    _recTopBlock() {
+      let top = null;
+      for (const b of this._recBlockPool) if (b.visible) top = b;
+      return top;
+    }
+
+    _recSetBlockOpacity(block, o) {
+      const clamped = Math.max(0, Math.min(1, o));
+      if (block.userData.box) block.userData.box.material.opacity = 0.42 * clamped;
+      if (block.userData.face) block.userData.face.material.opacity = clamped;
+    }
+
+    _recSetBlockEmissive(block, v) {
+      const m = block.userData.box && block.userData.box.material;
+      if (m && 'emissiveIntensity' in m) m.emissiveIntensity = v;
+    }
+
+    /** The travelling return-value bubble label. Cached via _recLabelTexture. */
+    _recSetBubble(value) {
+      const text = `⤴ ${value}`;
+      if (this._recBubble.userData.key === text) return;
+      this._recBubble.material.map = this._recLabelTexture(text);
+      this._recBubble.material.needsUpdate = true;
+      this._recBubble.userData.key = text;
     }
 
     /* ---------------------------------------------------------------------
@@ -1519,6 +1933,7 @@
       // works for the call tree), skip DS bookkeeping. The stack tower rides
       // the camera, so it stays anchored regardless of rotation.
       if (this._recActive) {
+        this._updateRecursion(t);
         this.camera.position.lerp(this._camTarget, this.CAM_LERP);
         this.camera.lookAt(0, 0, 0);
         this.field.rotation.x +=

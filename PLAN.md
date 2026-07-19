@@ -110,28 +110,103 @@ Verify: `node --check`; matrix math (identity, known rotation) checkable headles
 
 ---
 
-## PHASE 4 — Recursion Visualizer: Tree vs Stack (dsaEngine.js + render3d.js + app.js)
+## PHASE 4 — Recursion Visualizer: Call Graph vs 3D Stack Tower (dsaEngine.js + render3d.js + app.js)
 
-**dsaEngine.js** — add three genuinely recursive, instrumented algorithms that emit
-**call-frame events** into a parallel `callTrace` recorded alongside the model snapshot:
-- `fibonacci(n)`, `mergeSort(arr)`, and a recursive `dfsRecursive(start)`.
-- Each `_record` step also carries `frame:{event:'call'|'return', id, parentId, label,
-  locals, depth}`. This is additive — existing algorithms simply emit no `frame`.
-- New CPP_SOURCES listings + tabs for the three.
+Goal: handle standard mathematical + array recursion flawlessly (not just graph DFS).
+Tree View mimics recursionvisualizer.com UX; Stack View is a faithful 3D model of a
+call stack. Two coordinated views of the SAME call state, driven step-by-step and fully
+reversible.
 
-**render3d.js** — two visual modes, switchable:
-- **Tree Layout**: `_callGraphGroup`; each `call` spawns a temp activation node branching
-  downward (`x` by sibling order, `y = -depth*spacing`), lights the parent→child line in
-  a descend color; `return` dims/backtracks it.
-- **Stack Frame Tower**: `_stackTowerGroup` fixed to the side (screen-anchored via a
-  separate ortho-ish placement in world space); `call` pushes a translucent labeled block
-  on top, `return` pops with a fade. Reuse a small pool of block meshes.
-- Driven by replaying the current step's `frame` events as the trace steps forward/back.
+### 4.0 Reconciliation (a first-pass implementation already exists)
+Earlier this session Phase 4 was implemented at a basic level (fib/mergeSort/dfsRecursive,
+snapshot-driven tree + flat-slab stack, wired, `node --check` clean). This revised spec
+supersedes it. Carried over: snapshot-per-step model, pooled meshes, camera-anchored
+tower, mode toggle. Reworked: `emit*` authoring API, `locals`+`returnValue` in the frame,
+directed edges, return-bubble animation, glass-morphic multi-line blocks, push/pop slide
++ flash animations, depth-aware camera fit. `dfsRecursive` demoted to a bonus example;
+`fibonacci` + `mergeSort` are the first-class, fully-instrumented algorithms.
 
-**app.js** — recursion-mode toggle (Tree / Stack), wire the new algorithm tabs, feed
-`state.frame` to the renderer each flush.
+### 4.1 Engine — instrumented algorithms + emit* API (dsaEngine.js)
+Three genuinely recursive algorithms as instrumented state machines:
+- `fibonacci(n)` — exponential call tree (primary tree-view demo).
+- `mergeSort(arr)` — divide & conquer; args + array-slice locals (primary stack demo).
+- `dfsRecursive(start)` — kept as a bonus graph example.
 
-Verify: `node --check`; step through Fibonacci(5) and confirm call/return counts.
+**Authoring API (the algorithm calls these; they are thin wrappers):**
+- `emitCallEnter(label, args, locals)` — allocate a frame id, parent = current stack top,
+  push onto the live call-node list + live stack, then snapshot.
+- `emitLineHighlight(line, localsPatch?)` — patch the current frame's locals if given,
+  then snapshot at that source line.
+- `emitCallReturn(returnValue)` — set current frame `result`+`status:'returned'`, pop the
+  live stack, then snapshot carrying `returnValue`.
+
+**Recorded artifact = full snapshot, NOT an event delta.** Each emit* deep-copies the
+whole call-node list + live stack into `frame` and calls `_record`. Rationale: reverse
+stepping is a jump to snapshot N−1 (instant, lossless) — no inverse-event replay, which
+would be fragile given MergeSort's in-place mutation. This is what makes "perfect reverse
+order" cheap and correct. `emit*` naming gives clean instrumentation; snapshots give
+reversibility. (Additive: non-recursive algorithms emit no frame; `frame` stays null.)
+
+New CPP_SOURCES listings + algorithm tabs for the three.
+
+### 4.2 Frame schema (per recorded step)
+```
+frame = {
+  event:       'callEnter' | 'line' | 'return',
+  activeId,                       // frame this step acts on
+  returnValue,                    // meaningful only on 'return'
+  nodes: [ { id, parentId, depth, label, args, locals[], status, result } ],
+  stack: [ { id, label, args, locals[], depth } ],   // bottom -> top
+}
+```
+`locals` is an ordered `[{name, value}]` list so the stack block face renders faithfully.
+
+### 4.3 Tree "Call Graph" View (recursionvisualizer.com style) (render3d.js)
+- `_callGraphGroup` inside `field` (inherits pinch-rotate / zoom).
+- Node = one function execution instance; face text shows fn + params, e.g. `fib(4)`.
+- Stepping forward spawns child nodes downward (`x` by sibling order, `y=-depth*spacing`)
+  connected by **directed edges** (add an arrowhead — parent→child).
+- **Return Bubble:** on `emitCallReturn`, flip the returning node to a resolved neon-green
+  state, then animate the `returnValue` as a text sprite traveling *up* the edge to the
+  parent. Reverse step plays it traveling back *down* and reverts the node color.
+- Depth-aware fit: each render, measure the tree extents and lerp camera distance / group
+  scale so the whole graph stays framed.
+
+### 4.4 3D Stack Frame Tower (render3d.js)
+- Physical tower of `BoxGeometry` blocks with a **glass-morphic** material (high
+  transmission / low opacity, subtle emissive rim). Screen-anchored (child of camera).
+- `emitCallEnter` → push a block on top; multi-line canvas-texture face shows function
+  name, arguments passed in, and local variables (the "OS stack frame" — a faithful
+  teaching abstraction: signature + args + locals + return slot; NOT literal ABI layout,
+  registers, or padding).
+- `emitCallReturn` → flash the top block (return value generated), then slide it off the
+  tower and recycle it (pop). "Destroy" = animate-off + return to pool, never dispose
+  (keeps the frame loop allocation-free and undo cheap).
+- Deep recursion: seamlessly lerp tower scale down and/or translate the camera so the top
+  of the stack stays in view.
+
+### 4.5 Reversibility & animation policy
+- Authoritative state per step = the snapshot; applied instantly on any nav.
+- Animations are **transient flourishes** derived from the diff between adjacent snapshots
+  + step direction (`sign(newIndex-oldIndex)`): forward-over-return = bubble-up +
+  slide-off; backward-over-return = bubble-down + slide-on; forward-over-callEnter =
+  child spawn + block push; backward = child un-spawn + block un-push.
+- Interrupt policy: a new step arriving mid-flourish snaps the previous to its end state.
+- Swiping backward pops nodes off the call graph and pushes recycled blocks back onto the
+  tower in exact reverse order — a direct consequence of replaying snapshot N−1.
+
+### 4.6 app.js wiring
+- Recursion-mode toggle (Call Graph / Stack Tower); auto-enter when a recursive algo tab
+  is selected, exit otherwise; linear-algebra mode takes precedence.
+- Feed `state.frame` to the renderer each flush; renderer diffs against its stored last
+  frame to derive event + direction for the right flourish.
+
+### 4.7 Verify
+`node --check` on all touched files. Headless: step through Fibonacci(5) and assert
+call/return counts (15 activation nodes, 15 returns, root result 5), MergeSort produces a
+sorted root result, and every recorded `frame` is a self-contained snapshot whose
+`activeId` resolves within `nodes`. Browser review for the animations (bubble travel,
+glass blocks, slide/flash, depth fit) — I cannot run WebGL headless.
 
 ---
 
