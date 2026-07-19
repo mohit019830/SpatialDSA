@@ -70,6 +70,9 @@
           <button class="tab" data-algo="bstDelete">BST Delete</button>
           <button class="tab" data-algo="dfs">DFS</button>
           <button class="tab" data-algo="dijkstra">Dijkstra</button>
+          <button class="tab" data-algo="fibonacci">Fibonacci</button>
+          <button class="tab" data-algo="mergeSort">Merge Sort</button>
+          <button class="tab" data-algo="dfsRecursive">Rec. DFS</button>
         </nav>
         <pre class="code-block"><code id="codeTrace"></code></pre>
       </section>
@@ -146,6 +149,19 @@
             <button class="btn-mini" data-preset="squash">Collapse</button>
           </div>
         </div>
+      </section>
+
+      <!-- Recursion visualizer (call tree ↔ stack tower) -->
+      <section class="card recursion-card">
+        <div class="card-head">
+          <h2>Recursion</h2>
+          <span id="recStatus" class="desc-badge">tree view</span>
+        </div>
+        <nav class="tabs" id="recViewTabs">
+          <button class="tab active" data-recview="tree">Call Tree</button>
+          <button class="tab" data-recview="stack">Stack Frames</button>
+        </nav>
+        <p class="hint">Pick Fibonacci, Merge Sort, or Rec. DFS above, then Build &amp; Execute. The Call Tree shows every activation; Stack Frames shows the live call stack growing and unwinding.</p>
       </section>
     </aside>
 

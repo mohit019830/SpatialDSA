@@ -200,6 +200,33 @@ const CPP_SOURCES = {
     '    }',
     '}',
   ],
+
+  fibonacci: [
+    'int fib(int n) {',
+    '    if (n <= 1)',
+    '        return n;              // base case',
+    '    return fib(n - 1) + fib(n - 2);',
+    '}',
+  ],
+
+  mergeSort: [
+    'void mergeSort(vector<int>& a, int l, int r) {',
+    '    if (l >= r) return;        // base case: 0 or 1 element',
+    '    int m = (l + r) / 2;',
+    '    mergeSort(a, l, m);        // sort left half',
+    '    mergeSort(a, m + 1, r);    // sort right half',
+    '    merge(a, l, m, r);         // combine sorted halves',
+    '}',
+  ],
+
+  dfsRecursive: [
+    'void dfs(int u) {',
+    '    visited[u] = true;         // mark on entry',
+    '    for (int v : adj[u])',
+    '        if (!visited[v])',
+    '            dfs(v);            // recurse into neighbor',
+    '}',
+  ],
 };
 
 /* ===========================================================================
@@ -680,6 +707,7 @@ class DSAEngine {
         lineIndex: step.lineIndex,
         description: step.description,
         algorithm: step.algorithm,
+        frame: step.frame || null,
         stepIndex: this.historyIndex,
         stepCount: this.algorithmHistory.length,
         playing: true,
@@ -690,6 +718,7 @@ class DSAEngine {
       lineIndex: -1,
       description: 'Live editing — spawn and connect nodes in mid-air.',
       algorithm: this.activeAlgorithm,
+      frame: null,
       stepIndex: -1,
       stepCount: this.algorithmHistory.length,
       playing: false,
@@ -700,12 +729,17 @@ class DSAEngine {
    * Push one immutable snapshot onto the history. This is the ONLY place a
    * step is recorded, guaranteeing every step is a deep clone.
    */
-  _record(model, lineIndex, description, algorithm) {
+  _record(model, lineIndex, description, algorithm, frame = null) {
     this.algorithmHistory.push({
       model: deepClone(model),
       lineIndex,
       description,
       algorithm,
+      // Recursion algorithms carry a call-frame event describing the change to
+      // the call stack at this step (see the recursion visualizer). Non-
+      // recursive algorithms simply omit it, so it defaults to null and the
+      // renderer's recursion layer stays dormant.
+      frame: frame ? deepClone(frame) : null,
     });
   }
 
@@ -773,6 +807,15 @@ class DSAEngine {
       case 'dijkstra':
       case 'graph':
         this._traceDijkstra();
+        break;
+      case 'fibonacci':
+        this._traceFibonacci();
+        break;
+      case 'mergeSort':
+        this._traceMergeSort();
+        break;
+      case 'dfsRecursive':
+        this._traceDFSRecursive();
         break;
       default:
         console.warn('[dsaEngine] no trace builder for', this.activeAlgorithm);
@@ -1434,6 +1477,225 @@ class DSAEngine {
       (n) => (n.state = settled.has(n.uuid) ? 'path' : 'default')
     );
     this._record(model, 11, 'Queue empty → shortest paths finalized.', ALGO);
+  }
+
+  /* --------------------------------------------------------------------- */
+  /* RECURSION VISUALIZER — call-frame instrumented algorithms             */
+  /*                                                                       */
+  /* These three algorithms are genuinely recursive and emit a `frame`     */
+  /* snapshot alongside every recorded step. The frame is a FULL, self-    */
+  /* contained description of the call state at that moment (not a delta), */
+  /* so the renderer can draw any step directly and trace navigation       */
+  /* (back/forward/jump) stays lossless — mirroring how model snapshots    */
+  /* already work.                                                         */
+  /*                                                                       */
+  /* frame = {                                                             */
+  /*   event : 'call' | 'return',   // what just happened (drives emphasis)*/
+  /*   activeId,                    // the frame entered/left this step     */
+  /*   nodes : [{id, parentId, depth, label, status, result}],  // call tree*/
+  /*   stack : [{id, label, depth}],            // live call stack (bottom→top)*/
+  /* }                                                                     */
+  /* status: 'active' (on the stack) | 'returned' (finished).              */
+  /* --------------------------------------------------------------------- */
+
+  /** Build a full call-state snapshot from the tracer's working arrays. */
+  _recFrame(event, activeId, callNodes, stack) {
+    return {
+      event,
+      activeId,
+      nodes: callNodes.map((n) => ({
+        id: n.id,
+        parentId: n.parentId,
+        depth: n.depth,
+        label: n.label,
+        status: n.status,
+        result: n.result,
+      })),
+      stack: stack.map((id) => {
+        const n = callNodes.find((c) => c.id === id);
+        return { id, label: n.label, depth: n.depth };
+      }),
+    };
+  }
+
+  /* ALGORITHM 6 — Recursive Fibonacci (exponential call tree) ----------- */
+  _traceFibonacci() {
+    const ALGO = 'fibonacci';
+    // The recursion view owns the stage; no data-structure model is shown.
+    const model = { nodes: [], edges: [] };
+
+    // Input n: use the first live node's value if present (clamped to a small
+    // range so the tree stays legible), else default to 5.
+    let n = 5;
+    if (this.model.nodes.length) {
+      const v = Math.round(this.model.nodes[0].value);
+      if (Number.isFinite(v)) n = Math.max(1, Math.min(7, v));
+    }
+
+    const callNodes = [];
+    const stack = [];
+    let nextId = 0;
+
+    const fib = (val, parentId, depth) => {
+      const id = nextId++;
+      const node = {
+        id, parentId, depth,
+        label: `fib(${val})`, status: 'active', result: null,
+      };
+      callNodes.push(node);
+      stack.push(id);
+      this._record(model, 0, `Call fib(${val})`, ALGO,
+        this._recFrame('call', id, callNodes, stack));
+
+      let result;
+      if (val <= 1) {
+        this._record(model, 1, `fib(${val}): n ≤ 1 → base case`, ALGO,
+          this._recFrame('call', id, callNodes, stack));
+        result = val;
+        node.result = result;
+        this._record(model, 2, `Return ${result} (base case)`, ALGO,
+          this._recFrame('call', id, callNodes, stack));
+      } else {
+        this._record(model, 3, `fib(${val}) needs fib(${val - 1}) + fib(${val - 2})`,
+          ALGO, this._recFrame('call', id, callNodes, stack));
+        const a = fib(val - 1, id, depth + 1);
+        const b = fib(val - 2, id, depth + 1);
+        result = a + b;
+        node.result = result;
+      }
+
+      node.status = 'returned';
+      stack.pop();
+      this._record(model, val <= 1 ? 2 : 3, `fib(${val}) returns ${result}`, ALGO,
+        this._recFrame('return', id, callNodes, stack));
+      return result;
+    };
+
+    fib(n, null, 0);
+  }
+
+  /* ALGORITHM 7 — Recursive Merge Sort (divide & conquer tree) ---------- */
+  _traceMergeSort() {
+    const ALGO = 'mergeSort';
+    const model = { nodes: [], edges: [] };
+
+    // Seed the array from live node values (up to 8), else a fixed sample.
+    let arr = this.model.nodes
+      .map((n) => Math.round(n.value))
+      .filter((v) => Number.isFinite(v))
+      .slice(0, 8);
+    if (arr.length < 2) arr = [5, 2, 8, 1, 9, 3, 7, 4];
+
+    const callNodes = [];
+    const stack = [];
+    let nextId = 0;
+    const sub = (l, r) => `[${arr.slice(l, r + 1).join(',')}]`;
+
+    const mergeSort = (l, r, parentId, depth) => {
+      const id = nextId++;
+      const node = {
+        id, parentId, depth,
+        label: sub(l, r), status: 'active', result: null,
+      };
+      callNodes.push(node);
+      stack.push(id);
+      this._record(model, 0, `mergeSort(l=${l}, r=${r}) → ${sub(l, r)}`, ALGO,
+        this._recFrame('call', id, callNodes, stack));
+
+      if (l >= r) {
+        node.result = arr.slice(l, r + 1).join(',') || '∅';
+        this._record(model, 1, `l ≥ r → base case ${sub(l, r)}`, ALGO,
+          this._recFrame('call', id, callNodes, stack));
+      } else {
+        const m = Math.floor((l + r) / 2);
+        this._record(model, 2, `split at m=${m}`, ALGO,
+          this._recFrame('call', id, callNodes, stack));
+        mergeSort(l, m, id, depth + 1);
+        mergeSort(m + 1, r, id, depth + 1);
+
+        // Merge the two now-sorted halves in place.
+        this._record(model, 5, `merge halves of ${sub(l, r)}`, ALGO,
+          this._recFrame('call', id, callNodes, stack));
+        const merged = arr.slice(l, r + 1).sort((a, b) => a - b);
+        for (let i = 0; i < merged.length; i++) arr[l + i] = merged[i];
+        node.label = sub(l, r);
+        node.result = merged.join(',');
+      }
+
+      node.status = 'returned';
+      stack.pop();
+      this._record(model, 0, `sorted → ${node.label}`, ALGO,
+        this._recFrame('return', id, callNodes, stack));
+      return node.result;
+    };
+
+    mergeSort(0, arr.length - 1, null, 0);
+  }
+
+  /* ALGORITHM 8 — Recursive DFS (implicit call-stack traversal) --------- */
+  _traceDFSRecursive() {
+    const ALGO = 'dfsRecursive';
+    const model = this._workingModel();
+    if (model.nodes.length === 0) return;
+
+    const graph = this._buildGraphFromModel(model);
+    const start = model.nodes[0].uuid;
+    this._setAllNodeStates(model, 'default');
+    this._setAllEdgeStates(model, 'default');
+
+    const visited = new Set();
+    const callNodes = [];
+    const stack = [];
+    let nextId = 0;
+
+    const dfs = (u, parentId, depth) => {
+      const uNode = this._findNode(model, u);
+      const id = nextId++;
+      const node = {
+        id, parentId, depth,
+        label: `dfs(${uNode?.value})`, status: 'active', result: null,
+      };
+      callNodes.push(node);
+      stack.push(id);
+
+      // Mark the model so the visited frontier is meaningful too.
+      model.nodes.forEach((nn) => {
+        if (visited.has(nn.uuid)) nn.state = 'visited';
+      });
+      if (uNode) uNode.state = 'active';
+      this._record(model, 0, `Enter dfs(${uNode?.value})`, ALGO,
+        this._recFrame('call', id, callNodes, stack));
+
+      visited.add(u);
+      if (uNode) uNode.state = 'visited';
+      this._record(model, 1, `visited[${uNode?.value}] = true`, ALGO,
+        this._recFrame('call', id, callNodes, stack));
+
+      const nbrs = graph.neighbors(u);
+      for (const { to: v } of nbrs) {
+        const vNode = this._findNode(model, v);
+        if (!visited.has(v)) {
+          const edge = model.edges.find(
+            (e) => (e.from === u && e.to === v) || (e.from === v && e.to === u)
+          );
+          if (edge) edge.state = 'path';
+          this._record(model, 4, `dfs(${uNode?.value}) → recurse into ${vNode?.value}`,
+            ALGO, this._recFrame('call', id, callNodes, stack));
+          dfs(v, id, depth + 1);
+        } else {
+          this._record(model, 3, `${vNode?.value} already visited → skip`, ALGO,
+            this._recFrame('call', id, callNodes, stack));
+        }
+      }
+
+      node.status = 'returned';
+      stack.pop();
+      if (uNode) uNode.state = 'visited';
+      this._record(model, 0, `Return from dfs(${uNode?.value})`, ALGO,
+        this._recFrame('return', id, callNodes, stack));
+    };
+
+    dfs(start, null, 0);
   }
 }
 

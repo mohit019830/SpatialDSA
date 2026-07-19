@@ -145,6 +145,38 @@
     });
     SHARED.cursorCoreMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
 
+    // --- Recursion visualizer assets (Phase 4) --------------------------
+    // Activation-node box (call tree) + flat slab (stack tower). Materials
+    // keyed by call-state so a frame swap is a reference change, no alloc.
+    SHARED.recNodeGeo = new THREE.BoxGeometry(2.6, 1.3, 0.5);
+    SHARED.recBlockGeo = new THREE.BoxGeometry(4.6, 1.3, 0.4);
+    const REC_STATE_COLOR = {
+      active:   0x00f3ff, // the frame entered this step
+      onstack:  0x2aa9c9, // still on the call stack (ancestor)
+      return:   0x00ff9c, // returning this step
+      returned: 0xbd00ff, // finished / popped
+    };
+    SHARED.recNodeMat = {};
+    for (const k of Object.keys(REC_STATE_COLOR)) {
+      const color = REC_STATE_COLOR[k];
+      SHARED.recNodeMat[k] = new THREE.MeshLambertMaterial({
+        color,
+        emissive: color,
+        emissiveIntensity: k === 'active' || k === 'return' ? 0.85 : 0.4,
+        transparent: true,
+        opacity: k === 'returned' ? 0.55 : 0.9,
+      });
+    }
+    SHARED.recLinkMat = {
+      idle: new THREE.LineBasicMaterial({
+        color: 0x2f6d7a, transparent: true, opacity: 0.5, depthWrite: false,
+      }),
+      active: new THREE.LineBasicMaterial({
+        color: 0x00f3ff, transparent: true, opacity: 0.95,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      }),
+    };
+
     SHARED.ready = true;
   }
 
@@ -296,6 +328,9 @@
 
       // --- Linear-algebra mode (3B1B-style grid transformer) -------------
       this._buildLinearAlgebra();
+
+      // --- Recursion visualizer (call tree + stack tower) ----------------
+      this._buildRecursion();
 
       this._running = false;
       this._boundResize = () => this.resize();
@@ -1152,6 +1187,298 @@
       return this._laGrabbed !== null && this._laGrabbed !== undefined;
     }
 
+    /* =====================================================================
+     * RECURSION VISUALIZER (Phase 4)
+     *
+     * Two coordinated views of the SAME call state, driven by the engine's
+     * per-step `frame` snapshot (see dsaEngine `_recFrame`):
+     *
+     *   • CALL-TREE  — every call becomes an activation node placed by
+     *     (depth → y, sibling order → x); parent→child links light up as the
+     *     recursion descends and dim on return. Lives in `field`, so it
+     *     inherits pinch-rotate / zoom like the data structures.
+     *
+     *   • STACK-TOWER — the live call stack as a vertical stack of labeled
+     *     blocks, screen-anchored to the right so it reads like a real stack
+     *     frame diagram. Pushes on `call`, pops (fades) on `return`.
+     *
+     * Both reuse pooled meshes/sprites — nothing is allocated per step.
+     * The DS layer (nodes/edges/grid) is hidden while recursion mode is on.
+     * ================================================================== */
+    _buildRecursion() {
+      // --- CALL-TREE group (rotates with the field) ----------------------
+      this._recTreeGroup = new THREE.Group();
+      this._recTreeGroup.visible = false;
+      this.field.add(this._recTreeGroup);
+
+      // --- STACK-TOWER group (screen-anchored: child of camera) ----------
+      // Parenting to the camera keeps the tower fixed on-screen regardless of
+      // field rotation / camera dolly, giving it that HUD-diagram feel.
+      this._recStackGroup = new THREE.Group();
+      this._recStackGroup.visible = false;
+      this.camera.add(this._recStackGroup);
+      // Ensure the camera is in the scene graph so its child renders.
+      if (!this.camera.parent) this.scene.add(this.camera);
+      // Park the tower in the lower-right of the view, a fixed distance ahead.
+      this._recStackGroup.position.set(9.5, -5.5, -22);
+
+      // Pools (grown on demand, hidden when unused — never freed).
+      this._recNodePool = [];   // activation-node meshes for the tree
+      this._recLinkPool = [];   // parent→child lines for the tree
+      this._recBlockPool = [];  // stack-frame blocks for the tower
+
+      this._recActive = false;
+      this._recMode = 'tree';   // 'tree' | 'stack'
+
+      // Layout constants.
+      this.REC_X_SPACING = 3.4;
+      this.REC_Y_SPACING = 4.2;
+      this.REC_BLOCK_H = 1.6;   // stack block height + gap
+    }
+
+    /**
+     * A small labeled activation node: a rounded box + a billboard text label.
+     * Reused from a pool. `_recLabelTexture` caches per-string canvases.
+     */
+    _makeRecNode() {
+      const group = new THREE.Group();
+      const box = new THREE.Mesh(SHARED.recNodeGeo, SHARED.recNodeMat.active.clone());
+      group.add(box);
+      group.userData.box = box;
+
+      const sprite = new THREE.Sprite(
+        new THREE.SpriteMaterial({ transparent: true, depthWrite: false, depthTest: false })
+      );
+      sprite.scale.set(3.0, 1.5, 1);
+      sprite.position.set(0, 0, 0.35);
+      group.add(sprite);
+      group.userData.sprite = sprite;
+      group.userData.labelKey = null;
+      group.visible = false;
+      this._recTreeGroup.add(group);
+      return group;
+    }
+
+    /** A stack-frame block for the tower (flat translucent slab + label). */
+    _makeRecBlock() {
+      const group = new THREE.Group();
+      const slab = new THREE.Mesh(SHARED.recBlockGeo, SHARED.recNodeMat.active.clone());
+      group.add(slab);
+      group.userData.slab = slab;
+
+      const sprite = new THREE.Sprite(
+        new THREE.SpriteMaterial({ transparent: true, depthWrite: false, depthTest: false })
+      );
+      sprite.scale.set(4.2, 1.2, 1);
+      sprite.position.set(0, 0, 0.3);
+      group.add(sprite);
+      group.userData.sprite = sprite;
+      group.userData.labelKey = null;
+      group.visible = false;
+      this._recStackGroup.add(group);
+      return group;
+    }
+
+    /** A thin line connecting two tree points. Pooled. */
+    _makeRecLink() {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
+      const line = new THREE.Line(geo, SHARED.recLinkMat.idle.clone());
+      line.frustumCulled = false;
+      line.visible = false;
+      this._recTreeGroup.add(line);
+      return line;
+    }
+
+    /** Canvas label texture for recursion nodes, cached by text. */
+    _recLabelTexture(text) {
+      if (!this._recLabelCache) this._recLabelCache = new Map();
+      if (this._recLabelCache.has(text)) return this._recLabelCache.get(text);
+      const w = 256, h = 128;
+      const cvs = document.createElement('canvas');
+      cvs.width = w; cvs.height = h;
+      const ctx = cvs.getContext('2d');
+      ctx.clearRect(0, 0, w, h);
+      ctx.font = 'bold 44px "Segoe UI", system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.shadowColor = '#00f3ff';
+      ctx.shadowBlur = 12;
+      ctx.fillStyle = '#eafcff';
+      ctx.fillText(text, w / 2, h / 2 + 2);
+      const tex = new THREE.CanvasTexture(cvs);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.anisotropy = 4;
+      tex.needsUpdate = true;
+      this._recLabelCache.set(text, tex);
+      return tex;
+    }
+
+    /** Set a pooled group's label sprite, reusing cached textures. */
+    _recSetLabel(group, text) {
+      if (group.userData.labelKey === text) return;
+      group.userData.sprite.material.map = this._recLabelTexture(text);
+      group.userData.sprite.material.needsUpdate = true;
+      group.userData.labelKey = text;
+    }
+
+    /**
+     * Enter recursion mode. Hides the DS layer + grid, parks the camera to a
+     * head-on view, and shows whichever recursion sub-view is selected.
+     */
+    enterRecursionMode(mode) {
+      if (!this._recTreeGroup) this._buildRecursion();
+      this._recActive = true;
+      this._recMode = mode === 'stack' ? 'stack' : 'tree';
+
+      for (const g of this.nodeMeshes.values()) g.visible = false;
+      for (const g of this.edgeMeshes.values()) g.visible = false;
+      this.grid.visible = false;
+      this._linkLine.visible = false;
+      if (this.laGroup) this.laGroup.visible = false;
+
+      // Head-on parked camera; no auto-orbit so the diagram stays readable.
+      this.autoRotate = false;
+      this._camTarget.set(0, 0, 40);
+      this.field.rotation.set(0, 0, 0);
+      this._rotTarget.set(0, 0, 0, 'YXZ');
+
+      this._applyRecMode();
+    }
+
+    /** Switch between 'tree' and 'stack' sub-views without leaving the mode. */
+    setRecursionMode(mode) {
+      this._recMode = mode === 'stack' ? 'stack' : 'tree';
+      if (this._recActive) this._applyRecMode();
+    }
+
+    _applyRecMode() {
+      const treeOn = this._recMode === 'tree';
+      this._recTreeGroup.visible = treeOn;
+      this._recStackGroup.visible = !treeOn;
+      // Re-render the last frame into the now-visible view.
+      if (this._recLastFrame) this.renderFrame(this._recLastFrame);
+    }
+
+    /** Leave recursion mode and restore the data-structure layer. */
+    exitRecursionMode() {
+      this._recActive = false;
+      if (this._recTreeGroup) this._recTreeGroup.visible = false;
+      if (this._recStackGroup) this._recStackGroup.visible = false;
+      for (const g of this.nodeMeshes.values()) g.visible = true;
+      for (const g of this.edgeMeshes.values()) g.visible = true;
+      this.grid.visible = true;
+    }
+
+    /**
+     * Render a single call-frame snapshot (from the engine). Idempotent and
+     * order-independent, so trace back/forward/jump all work by simply handing
+     * the current step's `frame` here. A null frame clears both views.
+     */
+    renderFrame(frame) {
+      if (!this._recTreeGroup) this._buildRecursion();
+      this._recLastFrame = frame || null;
+      if (!frame) {
+        this._recNodePool.forEach((g) => (g.visible = false));
+        this._recLinkPool.forEach((l) => (l.visible = false));
+        this._recBlockPool.forEach((b) => (b.visible = false));
+        return;
+      }
+      if (this._recMode === 'tree') this._renderCallTree(frame);
+      else this._renderStackTower(frame);
+    }
+
+    /* Lay the call tree out by depth (y) and sibling order (x). We compute a
+     * horizontal slot for each node by counting siblings per depth so the tree
+     * spreads without overlap; then center each depth row. */
+    _renderCallTree(frame) {
+      const nodes = frame.nodes;
+      // Assign an x-slot per node: order of appearance within its depth.
+      const perDepth = new Map();      // depth -> count so far
+      const slot = new Map();          // id -> slot index
+      const depthCount = new Map();    // depth -> total at that depth
+      for (const n of nodes) depthCount.set(n.depth, (depthCount.get(n.depth) || 0) + 1);
+      for (const n of nodes) {
+        const s = perDepth.get(n.depth) || 0;
+        slot.set(n.id, s);
+        perDepth.set(n.depth, s + 1);
+      }
+
+      const pos = new Map();           // id -> {x,y}
+      for (const n of nodes) {
+        const total = depthCount.get(n.depth);
+        const s = slot.get(n.id);
+        const x = (s - (total - 1) / 2) * this.REC_X_SPACING;
+        const y = 8 - n.depth * this.REC_Y_SPACING;
+        pos.set(n.id, { x, y });
+      }
+
+      // Draw links first (parent→child), then nodes on top.
+      let li = 0;
+      for (const n of nodes) {
+        if (n.parentId === null || n.parentId === undefined) continue;
+        const p = pos.get(n.parentId);
+        const c = pos.get(n.id);
+        if (!p || !c) continue;
+        const line = this._recLinkPool[li] || (this._recLinkPool[li] = this._makeRecLink());
+        li++;
+        const attr = line.geometry.getAttribute('position');
+        attr.setXYZ(0, p.x, p.y, 0);
+        attr.setXYZ(1, c.x, c.y, 0);
+        attr.needsUpdate = true;
+        // A link on the active path (child is the active frame or on the stack)
+        // glows; finished branches dim.
+        const onStack = frame.stack.some((f) => f.id === n.id);
+        line.material = onStack ? SHARED.recLinkMat.active : SHARED.recLinkMat.idle;
+        line.visible = true;
+      }
+      for (; li < this._recLinkPool.length; li++) this._recLinkPool[li].visible = false;
+
+      // Nodes.
+      let ni = 0;
+      for (const n of nodes) {
+        const g = this._recNodePool[ni] || (this._recNodePool[ni] = this._makeRecNode());
+        ni++;
+        const p = pos.get(n.id);
+        g.position.set(p.x, p.y, 0);
+        const label = n.result !== null && n.result !== undefined && n.status === 'returned'
+          ? `${n.label}=${n.result}`
+          : n.label;
+        this._recSetLabel(g, label);
+        // Color: the active frame is neon; on-stack ancestors are cyan; returned
+        // frames go purple (done); everything else default.
+        let matKey = 'returned';
+        if (n.id === frame.activeId) matKey = frame.event === 'return' ? 'return' : 'active';
+        else if (frame.stack.some((f) => f.id === n.id)) matKey = 'onstack';
+        else if (n.status === 'active') matKey = 'onstack';
+        g.userData.box.material = SHARED.recNodeMat[matKey] || SHARED.recNodeMat.active;
+        g.visible = true;
+      }
+      for (; ni < this._recNodePool.length; ni++) this._recNodePool[ni].visible = false;
+    }
+
+    /* Render the live call stack as a tower of blocks growing upward. The
+     * active (top) frame is highlighted; a `return` event tints the top block
+     * so the pop reads clearly before it disappears next step. */
+    _renderStackTower(frame) {
+      const stack = frame.stack;
+      let bi = 0;
+      for (let i = 0; i < stack.length; i++) {
+        const f = stack[i];
+        const b = this._recBlockPool[bi] || (this._recBlockPool[bi] = this._makeRecBlock());
+        bi++;
+        // Bottom of stack at the lowest y, growing up.
+        b.position.set(0, i * this.REC_BLOCK_H, 0);
+        this._recSetLabel(b, f.label);
+        const isTop = i === stack.length - 1;
+        let matKey = 'onstack';
+        if (isTop) matKey = frame.event === 'return' ? 'return' : 'active';
+        b.userData.slab.material = SHARED.recNodeMat[matKey] || SHARED.recNodeMat.active;
+        b.visible = true;
+      }
+      for (; bi < this._recBlockPool.length; bi++) this._recBlockPool[bi].visible = false;
+    }
+
     /* ---------------------------------------------------------------------
      * Animation loop.
      * ------------------------------------------------------------------ */
@@ -1178,6 +1505,20 @@
       // camera/field, and skip the (hidden) data-structure bookkeeping.
       if (this._laActive) {
         this._updateLinearAlgebra(t);
+        this.camera.position.lerp(this._camTarget, this.CAM_LERP);
+        this.camera.lookAt(0, 0, 0);
+        this.field.rotation.x +=
+          (this._rotTarget.x - this.field.rotation.x) * this.ROT_LERP;
+        this.field.rotation.y +=
+          (this._rotTarget.y - this.field.rotation.y) * this.ROT_LERP;
+        this.renderer.render(this.scene, this.camera);
+        return;
+      }
+
+      // Recursion mode owns the stage: ease camera/field (pinch-rotate still
+      // works for the call tree), skip DS bookkeeping. The stack tower rides
+      // the camera, so it stays anchored regardless of rotation.
+      if (this._recActive) {
         this.camera.position.lerp(this._camTarget, this.CAM_LERP);
         this.camera.lookAt(0, 0, 0);
         this.field.rotation.x +=

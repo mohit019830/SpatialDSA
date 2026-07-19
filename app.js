@@ -72,6 +72,9 @@
     btnApplyMatrix: $('#btnApplyMatrix'),
     btnResetMatrix: $('#btnResetMatrix'),
     linalgPresets: $('#linalgPresets'),
+    // recursion visualizer
+    recViewTabs: $('#recViewTabs'),
+    recStatus: $('#recStatus'),
     // global input
     btnGestureToggle: $('#btnGestureToggle'),
     // hud
@@ -90,7 +93,13 @@
     bstDelete: 'BST DELETE',
     dfs: 'DFS',
     dijkstra: 'DIJKSTRA',
+    fibonacci: 'FIBONACCI',
+    mergeSort: 'MERGE SORT',
+    dfsRecursive: 'REC. DFS',
   };
+
+  /** Algorithms that drive the recursion visualizer (call tree + stack). */
+  const RECURSIVE_ALGOS = new Set(['fibonacci', 'mergeSort', 'dfsRecursive']);
 
   /* =========================================================================
    * Engine instances
@@ -142,6 +151,10 @@
   let gesturesEnabled = true;
   // True while the 3D stage is showing the linear-algebra grid transformer.
   let linearMode = false;
+  // True while the 3D stage is showing the recursion visualizer (auto-entered
+  // whenever a recursive algorithm is the active tab). 'tree' | 'stack'.
+  let recursionMode = false;
+  let recursionView = 'tree';
 
   // Ghost-node guard: never spawn within this of an existing node.
   const SPAWN_MIN_GAP = 1.5;   // world units (field-local)
@@ -175,7 +188,9 @@
     'if', 'else', 'while', 'for', 'return', 'new', 'continue', 'break',
     'nullptr', 'true', 'false', 'void', 'struct', 'class',
   ]);
-  const CPP_TYPES = new Set(['int', 'Node', 'stack', 'bool', 'float', 'double', 'auto']);
+  const CPP_TYPES = new Set([
+    'int', 'Node', 'stack', 'bool', 'float', 'double', 'auto', 'vector',
+  ]);
 
   /** Escape HTML so code text can't inject markup. */
   function esc(s) {
@@ -267,6 +282,10 @@
 
     // 3D model reconciliation (allocation-free, safe every frame).
     if (renderer) renderer.setModel(state.model);
+
+    // Recursion visualizer: hand the current step's call-frame snapshot to the
+    // renderer. Null frames (non-recursive steps / idle) simply clear it.
+    if (renderer && recursionMode) renderer.renderFrame(state.frame || null);
 
     // Heavy code-panel rebuild: gated on line/algorithm change only.
     if (state.lineIndex !== _lastRenderedLine || state.algorithm !== _lastRenderedAlgo) {
@@ -732,6 +751,7 @@
       // Re-render the source immediately (engine._resetTrace emits nothing here).
       renderCode(algo, -1);
       els.algoBadge.textContent = ALGO_LABELS[algo] || algo;
+      syncRecursionMode(algo);
     });
 
     els.voiceToggle.addEventListener('click', () => {
@@ -1009,6 +1029,7 @@
       syncAlgoTab(algo);
       renderCode(algo, -1);
       els.algoBadge.textContent = ALGO_LABELS[algo] || algo;
+      syncRecursionMode(algo);
     });
   }
 
@@ -1076,6 +1097,45 @@
     els.linalgDet.classList.toggle('is-error', Math.abs(d) < 1e-6);
   }
 
+  /* -------------------------------------------------------------------------
+   * RECURSION MODE toggling. A recursive algorithm tab auto-enters the
+   * visualizer; switching to any other algorithm leaves it. Linear-algebra
+   * mode wins over recursion (it fully owns the stage), so we never enter
+   * recursion while the grid transformer is active.
+   * ---------------------------------------------------------------------- */
+  function syncRecursionMode(algo) {
+    if (!renderer) return;
+    const wantRec = RECURSIVE_ALGOS.has(algo) && !linearMode;
+    if (wantRec && !recursionMode) {
+      recursionMode = true;
+      renderer.enterRecursionMode(recursionView);
+      setMode('RECURSION');
+      els.hudDesc.textContent =
+        'Build & Execute to watch the recursion unfold. Toggle Call Tree / Stack Frames in the Recursion card.';
+    } else if (wantRec && recursionMode) {
+      // Already in recursion mode — nothing to re-enter.
+    } else if (!wantRec && recursionMode) {
+      recursionMode = false;
+      renderer.exitRecursionMode();
+      renderer.resumeAutoOrbit();
+      setMode('IDLE');
+    }
+  }
+
+  function wireRecursion() {
+    els.recViewTabs.addEventListener('click', (e) => {
+      const btn = e.target.closest('.tab');
+      if (!btn || !renderer) return;
+      els.recViewTabs.querySelectorAll('.tab')
+        .forEach((t) => t.classList.remove('active'));
+      btn.classList.add('active');
+      recursionView = btn.getAttribute('data-recview') === 'stack' ? 'stack' : 'tree';
+      els.recStatus.textContent =
+        recursionView === 'stack' ? 'stack frames' : 'tree view';
+      if (recursionMode) renderer.setRecursionMode(recursionView);
+    });
+  }
+
   function wireLinearAlgebra() {
     // Mode toggle: Data Structure ↔ Grid Transform.
     els.linalgModeTabs.addEventListener('click', (e) => {
@@ -1090,6 +1150,11 @@
       linearMode = on;
       if (on) {
         stopExecute();
+        // Linear-algebra mode fully owns the stage — tear down recursion first.
+        if (recursionMode) {
+          recursionMode = false;
+          renderer.exitRecursionMode();
+        }
         renderer.enterLinearMode();
         const m = readMatrixCells();
         renderer.applyMatrix(m);
@@ -1101,6 +1166,8 @@
         renderer.exitLinearMode();
         renderer.resumeAutoOrbit();
         setMode('IDLE');
+        // Coming out of LA mode, re-enter recursion if a recursive algo is live.
+        syncRecursionMode(engine.activeAlgorithm);
       }
     });
 
@@ -1183,6 +1250,7 @@
     wireMouse();
     wireStructureInput();
     wireLinearAlgebra();
+    wireRecursion();
 
     // 1. 3D engine (required). Fail loudly if THREE / Renderer3D missing.
     if (!window.Render3D) {
