@@ -1914,6 +1914,90 @@ class DSAEngine {
   }
 
   /**
+   * @VIS:HIGHLIGHT — the ONE manual command left in the debugger-driven model.
+   * Line/stack tracing is automatic, but C++ array indices don't map to node
+   * uuids, so the user names a node explicitly to light it up during traversal.
+   * `uuid` is resolved by sandbox.js from the auto-setup id map; we mark that
+   * node 'active' (and clear any previously-active one) and snapshot it. `line`
+   * is optional — when the debugger drives, it passes the current line so the
+   * highlight lands on the right row.
+   */
+  sandboxHighlight(uuid, line) {
+    const nodes = this._sandboxModel.nodes;
+    let target = null;
+    for (const n of nodes) {
+      if (n.uuid === uuid) target = n;
+      else if (n.state === 'active') n.state = 'visited';
+    }
+    if (!target) return null;
+    target.state = 'active';
+    this._sandboxRecord(typeof line === 'number' ? line : -1,
+      `Highlight node ${target.value}`, 'line');
+    return uuid;
+  }
+
+  /**
+   * Auto-setup: build a graph from an explicit node count + edge list. Unlike
+   * _parseEdgeList (which only mints nodes that appear in an edge), this draws
+   * ALL `count` nodes 0..count-1 so isolated vertices from a "N M" test case
+   * still appear. Edges are the already-tokenized [a,b(,w)] pairs. Returns the
+   * same { nodes, edges, idMap } shape as the text parsers, recorded as ONE
+   * snapshot at history[0]. idMap keys are vertex ids as strings.
+   */
+  sandboxAutoGraph(count, pairs) {
+    const nodes = [];
+    const byId = new Map();
+    const n = Math.max(0, count | 0);
+    for (let i = 0; i < n; i++) {
+      const node = {
+        uuid: generateUUID(),
+        value: i,
+        position: { x: 0, y: 0, z: 0 },
+        state: 'default',
+      };
+      nodes.push(node);
+      byId.set(String(i), node);
+    }
+    // Seed on a circle before relaxing (degenerate at 0,0 otherwise).
+    const seedR = Math.max(6, n * 1.4);
+    nodes.forEach((node, i) => {
+      const ang = (i / Math.max(1, n)) * Math.PI * 2;
+      node.position.x = Math.cos(ang) * seedR;
+      node.position.y = Math.sin(ang) * seedR;
+    });
+
+    const edges = [];
+    const seen = new Set();
+    for (const p of (pairs || [])) {
+      const a = byId.get(String(p[0]));
+      const b = byId.get(String(p[1]));
+      if (!a || !b || a === b) continue;   // skip edges to nonexistent/self nodes
+      const k1 = `${a.uuid}|${b.uuid}`;
+      const k2 = `${b.uuid}|${a.uuid}`;
+      if (seen.has(k1) || seen.has(k2)) continue;
+      seen.add(k1);
+      edges.push({
+        uuid: generateUUID(),
+        from: a.uuid, to: b.uuid,
+        directed: true,
+        weight: p.length > 2 && Number.isFinite(p[2]) ? p[2] : 1,
+        state: 'default',
+      });
+    }
+
+    if (nodes.length) this._forceLayout(nodes, edges);
+
+    for (const node of nodes) this._sandboxModel.nodes.push(node);
+    for (const edge of edges) this._sandboxModel.edges.push(edge);
+    this._sandboxCount += nodes.length;
+    this._sandboxRecord(-1, `Setup graph: ${nodes.length} nodes, ${edges.length} edges`, 'line');
+
+    const idMap = new Map();
+    for (const [k, node] of byId) idMap.set(k, node.uuid);
+    return { nodes, edges, idMap };
+  }
+
+  /**
    * Finish a sandbox run: arm the history cursor at step 0 (if anything was
    * recorded) and emit once so the UI shows the first frame. Returns the step
    * count, mirroring buildTrace()'s contract.

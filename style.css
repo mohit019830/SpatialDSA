@@ -381,6 +381,21 @@ html, body {
   box-shadow: 0 0 0 1px rgba(0,255,156,.25);
 }
 
+/* Test-case format selector — picks the auto-setup parser for the stdin box. */
+.stdin-format-row {
+  display: flex; align-items: center; gap: 8px; margin: 6px 12px 0;
+}
+.stdin-format-row .stdin-label { margin: 0; flex: none; }
+.cpp-format {
+  flex: 1; box-sizing: border-box; padding: 5px 8px;
+  border: 1px solid var(--line); border-radius: 6px; background: #05080a;
+  color: var(--text); font-family: var(--mono); font-size: 11px; cursor: pointer;
+}
+.cpp-format:focus {
+  outline: none; border-color: var(--green);
+  box-shadow: 0 0 0 1px rgba(0,255,156,.25);
+}
+
 .sandbox-actions { display: flex; gap: 8px; padding: 8px 12px 0; }
 
 .cpp-terminal {

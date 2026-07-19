@@ -79,6 +79,7 @@
     cppStatus: $('#cppStatus'),
     cppTerminal: $('#cppTerminal'),
     cppStdin: $('#cppStdin'),
+    testCaseFormat: $('#testCaseFormat'),
     btnRunCpp: $('#btnRunCpp'),
     btnStopCpp: $('#btnStopCpp'),
     btnCppExample: $('#btnCppExample'),
@@ -1230,6 +1231,7 @@
       getCode: () =>
         (window.__cppEditor ? window.__cppEditor.getValue() : ''),
       getStdin: () => (els.cppStdin ? els.cppStdin.value : ''),
+      getFormat: () => (els.testCaseFormat ? els.testCaseFormat.value : 'raw'),
       hooks: {
         onStatus: (kind, text) => setCppStatus(kind, text),
         onTerminal: (text, kind) => appendTerminal(text, kind),
@@ -1269,43 +1271,54 @@
     els.btnCppExample.addEventListener('click', () => {
       if (window.__cppEditor) window.__cppEditor.setValue(EXAMPLE_CPP);
       if (els.cppStdin) els.cppStdin.value = EXAMPLE_STDIN;
-      appendTerminal('Loaded example: reads a graph (N, E, edges) from stdin.', 'dim');
+      if (els.testCaseFormat) els.testCaseFormat.value = 'graph';
+      appendTerminal('Loaded example: recursive DFS over a graph read from stdin. Stack + lines trace automatically.', 'dim');
     });
   }
 
   // A second, graph-flavored example the "Load Example" button can restore to.
-  // Competitive-Companion style: the whole graph comes from stdin. Read N (nodes)
-  // and E (edges), then E lines of "u v", and emit @VIS commands purely from the
-  // parsed input. Paste different test cases in the stdin box and re-run — no
-  // code changes needed.
-  const EXAMPLE_CPP = `// Reads a graph from stdin and visualizes it.
-// Input:  first line "N E", then E lines each "u v".
+  // A plain, unannotated DFS. The graph is drawn automatically from stdin (format
+  // = "Graph"), and the recursion — call stack + current line — is traced by the
+  // debugger with no @VIS scaffolding. The single manual line is the HIGHLIGHT
+  // that lights up each node as DFS visits it.
+  const EXAMPLE_CPP = `// Standard recursive DFS. Reads "N M" then M edges "u v".
+// The graph, call stack, and line highlighting are all automatic.
 #include <iostream>
 using namespace std;
 
-int main() {
-    int n, e;
-    cin >> n >> e;                 // node count, edge count
+int adj[100][100];   // adjacency matrix
+int deg[100];        // neighbor count per node
+bool seen[100];
 
-    // Create N nodes (id == value == index).
-    for (int i = 0; i < n; i++) {
-        cout << "@VIS:NODE:" << i << ":" << i << endl;
+void dfs(int u) {
+    seen[u] = true;
+    // The ONE manual command: light up the node we're visiting.
+    cout << "@VIS:HIGHLIGHT:" << u << endl;
+    for (int i = 0; i < deg[u]; i++) {
+        int v = adj[u][i];
+        if (!seen[v]) {
+            dfs(v);        // recursion → stack tower grows/unwinds on its own
+        }
     }
+}
 
-    // Read E edges and connect them.
-    for (int k = 0; k < e; k++) {
+int main() {
+    int n, m;
+    cin >> n >> m;
+    for (int k = 0; k < m; k++) {
         int u, v;
         cin >> u >> v;
-        cout << "@VIS:EDGE:" << u << ":" << v << endl;
+        adj[u][deg[u]++] = v;
+        adj[v][deg[v]++] = u;   // undirected
     }
-
-    cout << "built " << n << " nodes, " << e << " edges" << endl;
+    dfs(0);
+    cout << "dfs complete" << endl;
     return 0;
 }
 `;
 
-  // Default test case that pairs with EXAMPLE_CPP: 5 nodes, 5 edges (a little
-  // cycle with a tail). Loaded into the stdin box alongside the example.
+  // Default test case for EXAMPLE_CPP: 5 nodes, 5 edges (a 3-cycle with a tail).
+  // Format selector should be "Graph (N nodes, M edges)".
   const EXAMPLE_STDIN = `5 5
 0 1
 1 2

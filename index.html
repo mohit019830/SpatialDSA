@@ -177,6 +177,14 @@
           autocomplete="off" autocorrect="off" autocapitalize="off" wrap="off"
           aria-label="Standard input test cases"
           placeholder="Paste standard input (test cases) here…"></textarea>
+        <div class="stdin-format-row">
+          <label class="stdin-label" for="testCaseFormat">test case format</label>
+          <select id="testCaseFormat" class="cpp-format" aria-label="Test case format">
+            <option value="graph">Graph (N nodes, M edges)</option>
+            <option value="tree">Binary Tree Array</option>
+            <option value="raw">Raw Text (No Visualization)</option>
+          </select>
+        </div>
         <div class="sandbox-actions">
           <button id="btnRunCpp" class="btn btn-accent">▶ Run C++</button>
           <button id="btnStopCpp" class="btn" disabled>■ Stop</button>
@@ -184,13 +192,14 @@
         </div>
         <div id="cppTerminal" class="cpp-terminal" aria-live="polite" role="log"></div>
         <p class="hint">
-          Drive the visualizer from C++ with <code>cout</code>:
-          <code>@VIS:NODE:id:value</code>, <code>@VIS:EDGE:idA:idB</code>,
-          <code>@VIS:CALL:label:args</code>, <code>@VIS:RET:value</code>,
-          <code>@VIS:LINE:n</code>. Read test cases from the stdin box above with
-          <code>cin</code> / <code>scanf</code> / <code>getline</code>. Runs in a
-          sandboxed worker (5s cap). JSCPP supports core C++ + arrays + recursion;
-          most STL is unavailable.
+          Paste a standard algorithm and a test case, pick the format, and hit Run.
+          The <strong>call stack and line execution are traced automatically</strong>
+          — the 3D stack tower builds and unwinds as your code recurses, with no
+          extra code. To highlight a node during traversal, print one line:
+          <code>cout &lt;&lt; "@VIS:HIGHLIGHT:" &lt;&lt; nodeId &lt;&lt; endl;</code>
+          Read input with <code>cin</code> / <code>scanf</code>. Runs in a sandboxed
+          worker (5s cap). JSCPP supports core C++ + arrays + recursion; most STL is
+          unavailable.
         </p>
       </section>
     </aside>
