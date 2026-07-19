@@ -432,6 +432,7 @@ class DSAEngine {
     // so children of index i are 2i+1 and 2i+2 — matching LeetCode semantics.
     const nodeByIndex = new Map(); // arrayIndex -> node object
     const depthOf = new Map();     // arrayIndex -> depth
+    const idMap = new Map();       // node value -> uuid (sandbox id resolution)
     let maxDepth = 0;
 
     // Depth of implicit-heap index i is floor(log2(i+1)).
@@ -468,6 +469,10 @@ class DSAEngine {
       };
       nodeByIndex.set(i, node);
       nodes.push(node);
+      // Map the C++-visible integer (the node's value) onto its uuid so a
+      // sandbox @VIS:LAYOUT can later resolve highlights/edges by value. LeetCode
+      // arrays can repeat values; first occurrence wins (matches level-order id).
+      if (!idMap.has(String(tokens[i]))) idMap.set(String(tokens[i]), node.uuid);
     }
 
     // Edges: connect each present node to its present children (2i+1, 2i+2).
@@ -488,7 +493,7 @@ class DSAEngine {
       }
     }
 
-    return { nodes, edges };
+    return { nodes, edges, idMap };
   }
 
   /**
@@ -552,7 +557,13 @@ class DSAEngine {
     });
 
     this._forceLayout(order, edges);
-    return { nodes: order, edges };
+
+    // Vertex id (as written in the text) -> uuid, so a sandbox @VIS:LAYOUT can
+    // resolve subsequent edges/highlights against the ids the C++ program uses.
+    const idMap = new Map();
+    for (const [key, node] of nodeById) idMap.set(key, node.uuid);
+
+    return { nodes: order, edges, idMap };
   }
 
   /**
@@ -1774,6 +1785,51 @@ class DSAEngine {
     // Reuse the recursion tracker, but record against the sandbox model so
     // nodes/edges are captured in every frame snapshot too.
     this._recBegin(this._sandboxModel, 'customCpp');
+  }
+
+  /**
+   * @VIS:LAYOUT — bulk-populate the sandbox stage from a raw test-case string.
+   * `format` is 'tree' (LeetCode level-order array) or 'graph' (edge list). The
+   * matching parser builds fully-positioned nodes/edges (tree grid or force-
+   * directed spread), which we drop straight into the shared `_sandboxModel` and
+   * record as ONE snapshot. Because layout normally runs before any CALL/LINE,
+   * that snapshot lands at algorithmHistory[0] — the timeline opens on the whole
+   * structure, already positioned.
+   *
+   * Returns a plain object { id -> uuid } (never a Map, so sandbox.js can iterate
+   * it uniformly) mapping the integers the C++ program uses — node values for a
+   * tree, vertex ids for a graph — onto engine uuids, so later @VIS:EDGE /
+   * highlight / node-scoped commands resolve against the same handles.
+   */
+  sandboxLayout(format, text) {
+    let parsed;
+    if (format === 'tree') {
+      parsed = this._parseTreeArray(text);
+    } else if (format === 'graph') {
+      parsed = this._parseEdgeList(text);
+    } else {
+      throw new Error(`Unknown LAYOUT format "${format}" (expected tree|graph)`);
+    }
+    if (!parsed || parsed.nodes.length === 0) {
+      throw new Error('LAYOUT produced no nodes');
+    }
+
+    // Merge the parsed structure into the live sandbox model. Layout is a bulk
+    // seed, so append rather than assume an empty model (a program could emit a
+    // few @VIS:NODEs before a LAYOUT); the id map keeps the two id-spaces
+    // distinct since node ids are minted per source.
+    for (const node of parsed.nodes) this._sandboxModel.nodes.push(node);
+    for (const edge of parsed.edges) this._sandboxModel.edges.push(edge);
+    // Keep the spiral counter past the seeded nodes so a later @VIS:NODE doesn't
+    // spawn on top of the freshly-laid-out structure.
+    this._sandboxCount += parsed.nodes.length;
+
+    const kind = format === 'tree' ? 'tree' : 'graph';
+    this._sandboxRecord(-1, `Layout ${kind}: ${parsed.nodes.length} nodes, ${parsed.edges.length} edges`, 'line');
+
+    const out = {};
+    if (parsed.idMap) for (const [k, v] of parsed.idMap) out[k] = v;
+    return out;
   }
 
   /** id of the current top-of-stack frame, or null when the stack is empty. */

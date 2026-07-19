@@ -22,8 +22,20 @@
  *   @VIS:CALL:<label>:<args>    push a call frame (stack tower grows)
  *   @VIS:RET:<value>            pop the top call frame (unwinds)
  *   @VIS:LINE:<lineNumber>      highlight a 1-based source line
+ *   @VIS:LAYOUT:TREE:<array>    bulk-build a LeetCode tree, e.g.
+ *                               @VIS:LAYOUT:TREE:[3,9,20,null,null,15,7]
+ *   @VIS:LAYOUT:GRAPH:<edges>   bulk-build a graph from an edge list, e.g.
+ *                               @VIS:LAYOUT:GRAPH:[[0,1],[1,2],[2,0]]
  * The <id>→uuid mapping lives here (per design): the engine keys nodes by uuid,
  * the sandbox translates your integer ids onto them.
+ *
+ * MACRO LAYOUTS pass the raw test-case string straight to the engine's parser +
+ * auto-layout (tree grid / force-directed graph). The engine mints the nodes and
+ * hands back the id→uuid map, which we splice into `_idMap` SYNCHRONOUSLY before
+ * the next line is routed — so any following @VIS:EDGE / LINE / node-scoped
+ * command that names a tree value or vertex id resolves against the laid-out
+ * structure. A layout is recorded as the first trace step, so playback opens on
+ * the fully-positioned data structure.
  *
  * JSCPP LIMITS (documented for the user, surfaced in the terminal on error):
  *   JSCPP is an older, unmaintained interpreter. Basic types, arrays, pointers,
@@ -261,6 +273,34 @@
       const eng = this.engine;
 
       switch (cmd) {
+        case 'LAYOUT': {
+          // @VIS:LAYOUT:TREE:<array>  or  @VIS:LAYOUT:GRAPH:<edgelist>
+          // The payload can itself contain ':'-free brackets/commas, but rejoin
+          // the tail on ':' anyway so we never truncate an exotic string.
+          const kind = (parts[1] || '').trim().toUpperCase();
+          const payload = parts.slice(2).join(':').trim();
+          if (kind !== 'TREE' && kind !== 'GRAPH') {
+            throw new Error(`LAYOUT type must be TREE or GRAPH (got "${kind}")`);
+          }
+          if (payload === '') throw new Error('LAYOUT needs a data string');
+
+          const format = kind === 'TREE' ? 'tree' : 'graph';
+          // The engine parses + auto-lays-out and records the FIRST trace step,
+          // returning { id -> uuid }. Merge it into _idMap right now, before the
+          // next line is routed, so subsequent EDGE/LINE/highlight commands that
+          // reference tree values or vertex ids resolve against these nodes.
+          const map = eng.sandboxLayout(format, payload);
+          let mapped = 0;
+          for (const id in map) {
+            if (Object.prototype.hasOwnProperty.call(map, id)) {
+              this._idMap.set(id, map[id]);
+              mapped++;
+            }
+          }
+          this._cmdCount++;
+          this._term(`↳ LAYOUT ${kind}: positioned ${mapped} node(s).`, 'dim');
+          break;
+        }
         case 'NODE': {
           const id = parts[1] != null ? parts[1].trim() : '';
           const valRaw = parts[2] != null ? parts[2].trim() : id;
