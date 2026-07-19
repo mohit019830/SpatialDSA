@@ -75,6 +75,12 @@
     // recursion visualizer
     recViewTabs: $('#recViewTabs'),
     recStatus: $('#recStatus'),
+    // custom C++ sandbox
+    cppStatus: $('#cppStatus'),
+    cppTerminal: $('#cppTerminal'),
+    btnRunCpp: $('#btnRunCpp'),
+    btnStopCpp: $('#btnStopCpp'),
+    btnCppExample: $('#btnCppExample'),
     // global input
     btnGestureToggle: $('#btnGestureToggle'),
     // hud
@@ -155,6 +161,11 @@
   // whenever a recursive algorithm is the active tab). 'tree' | 'stack'.
   let recursionMode = false;
   let recursionView = 'tree';
+
+  // True while a custom-C++ sandbox run is on the stage. Unlike recursionMode,
+  // the DS layer stays visible (nodes + edges + call-stack overlay together).
+  let sandboxMode = false;
+  let sandbox = null;   // Sandbox.SandboxEngine, created in boot()
 
   // Ghost-node guard: never spawn within this of an existing node.
   const SPAWN_MIN_GAP = 1.5;   // world units (field-local)
@@ -283,9 +294,11 @@
     // 3D model reconciliation (allocation-free, safe every frame).
     if (renderer) renderer.setModel(state.model);
 
-    // Recursion visualizer: hand the current step's call-frame snapshot to the
-    // renderer. Null frames (non-recursive steps / idle) simply clear it.
-    if (renderer && recursionMode) {
+    // Recursion visualizer / sandbox overlay: hand the current step's call-frame
+    // snapshot to the renderer for the stack tower + call tree. Null frames
+    // (non-recursive steps / idle) simply clear it. In sandbox mode the DS layer
+    // renders underneath the tower rather than being hidden.
+    if (renderer && (recursionMode || sandboxMode)) {
       renderer.renderFrame(state.frame || null, state.stepIndex);
     }
 
@@ -626,6 +639,9 @@
    * Trace control (shared by buttons, swipes, and voice)
    * ====================================================================== */
   function buildTrace() {
+    // In sandbox mode the trace comes from @VIS output, not a trace builder, so
+    // never rebuild — just report the already-built step count.
+    if (sandboxMode) return engine.algorithmHistory.length;
     if (currentModel.nodes.length === 0) {
       els.hudDesc.textContent = 'Add some nodes first, then Build Trace.';
       return 0;
@@ -687,8 +703,24 @@
     if (executeTimer) { clearInterval(executeTimer); executeTimer = null; }
   }
 
+  /**
+   * Auto-play an ALREADY-BUILT history (no rebuild). The sandbox uses this: its
+   * trace is populated by @VIS commands, so calling the normal execute() would
+   * wrongly re-run buildTrace() and wipe it (customCpp has no trace builder).
+   */
+  function playExistingHistory() {
+    stopExecute();
+    if (engine.algorithmHistory.length === 0) return;
+    engine.jumpToStart();
+    executeTimer = setInterval(() => {
+      const advanced = engine.stepForward();
+      if (!advanced) stopExecute();
+    }, 900);
+  }
+
   function clearAll() {
     stopExecute();
+    exitSandboxStage();
     engine.clear();
     autoValue = 1;
     setMode('IDLE');
@@ -749,6 +781,7 @@
       btn.classList.add('active');
       const algo = btn.getAttribute('data-algo');
       stopExecute();
+      exitSandboxStage();   // switching algorithms leaves the C++ sandbox stage
       engine.setActiveAlgorithm(algo);
       // Re-render the source immediately (engine._resetTrace emits nothing here).
       renderCode(algo, -1);
@@ -1138,6 +1171,134 @@
     });
   }
 
+  /* -------------------------------------------------------------------------
+   * CUSTOM C++ SANDBOX wiring. Run C++ through JSCPP in a worker (sandbox.js),
+   * which streams @VIS commands back into the engine as a replayable trace. The
+   * usual Execute / Next / Back / swipe controls then play it, because a sandbox
+   * run populates the same algorithmHistory as any built-in algorithm.
+   * ---------------------------------------------------------------------- */
+  function appendTerminal(text, kind) {
+    const line = document.createElement('span');
+    line.className = 't-line t-' + (kind || 'out');
+    line.textContent = text;
+    els.cppTerminal.appendChild(line);
+    els.cppTerminal.scrollTop = els.cppTerminal.scrollHeight;
+  }
+
+  function setCppStatus(kind, text) {
+    els.cppStatus.textContent = text;
+    els.cppStatus.classList.toggle('is-error', kind === 'error');
+  }
+
+  function enterSandboxStage() {
+    // A sandbox run owns the stage like recursion does, but keeps the DS layer
+    // visible. Tear down any competing mode first.
+    stopExecute();
+    if (linearMode) {
+      renderer.exitLinearMode();
+      els.linalgBody.classList.add('hidden');
+      els.linalgModeTabs.querySelectorAll('.tab').forEach((t, i) =>
+        t.classList.toggle('active', i === 0));
+      linearMode = false;
+    }
+    if (recursionMode) {
+      recursionMode = false;
+      renderer.exitRecursionMode();
+    }
+    sandboxMode = true;
+    if (renderer.enterSandboxMode) renderer.enterSandboxMode();
+    setMode('C++ SANDBOX');
+  }
+
+  /** Leave the sandbox stage (called when switching to another mode). */
+  function exitSandboxStage() {
+    if (!sandboxMode) return;
+    if (sandbox && sandbox.running) sandbox.stop();
+    sandboxMode = false;
+    if (renderer && renderer.exitSandboxMode) renderer.exitSandboxMode();
+    els.btnRunCpp.disabled = false;
+    els.btnStopCpp.disabled = true;
+  }
+
+  function wireSandbox() {
+    if (!window.Sandbox) return;   // sandbox.js failed to load; card stays inert
+
+    sandbox = new window.Sandbox.SandboxEngine({
+      engine,
+      getRenderer: () => renderer,
+      getCode: () =>
+        (window.__cppEditor ? window.__cppEditor.getValue() : ''),
+      hooks: {
+        onStatus: (kind, text) => setCppStatus(kind, text),
+        onTerminal: (text, kind) => appendTerminal(text, kind),
+        onRunStart: () => {
+          els.cppTerminal.innerHTML = '';
+          els.btnRunCpp.disabled = true;
+          els.btnStopCpp.disabled = false;
+          enterSandboxStage();
+        },
+        onRunEnd: (success) => {
+          els.btnRunCpp.disabled = false;
+          els.btnStopCpp.disabled = true;
+          // If the run produced steps, auto-play the already-built history so
+          // the graph + stack build up visibly; the user can then scrub with
+          // Back/Next. NOT execute() — that would rebuild and wipe the trace.
+          if (success && engine.algorithmHistory.length > 0) {
+            playExistingHistory();
+          }
+        },
+      },
+    });
+
+    els.btnRunCpp.addEventListener('click', () => {
+      if (!window.__cppEditorReady) {
+        appendTerminal('Editor still loading — try again in a moment.', 'dim');
+        return;
+      }
+      sandbox.run();
+    });
+
+    els.btnStopCpp.addEventListener('click', () => {
+      sandbox.stop('■ Stopped by user.');
+      els.btnRunCpp.disabled = false;
+      els.btnStopCpp.disabled = true;
+    });
+
+    els.btnCppExample.addEventListener('click', () => {
+      if (window.__cppEditor) window.__cppEditor.setValue(EXAMPLE_CPP);
+      appendTerminal('Loaded example: recursive Fibonacci + graph.', 'dim');
+    });
+  }
+
+  // A second, graph-flavored example the "Load Example" button can restore to.
+  const EXAMPLE_CPP = `// Build a binary tree as a graph, then walk it recursively.
+#include <iostream>
+using namespace std;
+
+// Emit a node (id == value here) and connect it to its parent.
+void node(int id) { cout << "@VIS:NODE:" << id << ":" << id << endl; }
+void edge(int a, int b) { cout << "@VIS:EDGE:" << a << ":" << b << endl; }
+
+void visit(int id, int depth) {
+    cout << "@VIS:CALL:visit(" << id << "):depth=" << depth << endl;
+    if (depth < 3) {
+        int l = id * 2, r = id * 2 + 1;
+        node(l); edge(id, l);
+        node(r); edge(id, r);
+        visit(l, depth + 1);
+        visit(r, depth + 1);
+    }
+    cout << "@VIS:RET:" << id << endl;
+}
+
+int main() {
+    node(1);
+    visit(1, 1);
+    cout << "tree built" << endl;
+    return 0;
+}
+`;
+
   function wireLinearAlgebra() {
     // Mode toggle: Data Structure ↔ Grid Transform.
     els.linalgModeTabs.addEventListener('click', (e) => {
@@ -1152,6 +1313,7 @@
       linearMode = on;
       if (on) {
         stopExecute();
+        exitSandboxStage();
         // Linear-algebra mode fully owns the stage — tear down recursion first.
         if (recursionMode) {
           recursionMode = false;
@@ -1253,6 +1415,7 @@
     wireStructureInput();
     wireLinearAlgebra();
     wireRecursion();
+    wireSandbox();
 
     // 1. 3D engine (required). Fail loudly if THREE / Renderer3D missing.
     if (!window.Render3D) {

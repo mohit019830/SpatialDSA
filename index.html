@@ -163,6 +163,29 @@
         </nav>
         <p class="hint">Pick Fibonacci, Merge Sort, or Rec. DFS above, then Build &amp; Execute. The Call Tree shows every activation; Stack Frames shows the live call stack growing and unwinding.</p>
       </section>
+
+      <!-- Custom C++ sandbox: write real C++, run it through JSCPP in a worker,
+           and drive the 3D scene via @VIS: cout commands. -->
+      <section class="card sandbox-card">
+        <div class="card-head">
+          <h2>Custom C++</h2>
+          <span id="cppStatus" class="desc-badge">idle</span>
+        </div>
+        <div id="cmEditor" class="cm-mount" aria-label="C++ source editor"></div>
+        <div class="sandbox-actions">
+          <button id="btnRunCpp" class="btn btn-accent">▶ Run C++</button>
+          <button id="btnStopCpp" class="btn" disabled>■ Stop</button>
+          <button id="btnCppExample" class="btn btn-ghost">Load Example</button>
+        </div>
+        <div id="cppTerminal" class="cpp-terminal" aria-live="polite" role="log"></div>
+        <p class="hint">
+          Drive the visualizer from C++ with <code>cout</code>:
+          <code>@VIS:NODE:id:value</code>, <code>@VIS:EDGE:idA:idB</code>,
+          <code>@VIS:CALL:label:args</code>, <code>@VIS:RET:value</code>,
+          <code>@VIS:LINE:n</code>. Runs in a sandboxed worker (5s cap). JSCPP
+          supports core C++ + arrays + recursion; most STL is unavailable.
+        </p>
+      </section>
     </aside>
 
     <!-- ---------- RIGHT PANEL (70%) : 3D Universe ---------- -->
@@ -203,11 +226,102 @@
   <!-- Three.js core (UMD build exposes global THREE). Pinned version. -->
   <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
 
+  <!-- CodeMirror 6 is ESM-only (no UMD bundle), so it loads via an import map +
+       a module bootstrap below. JSCPP itself is NOT loaded here — sandbox.js
+       importScripts() it inside the Web Worker so a runaway program can't block
+       the main thread. -->
+  <script type="importmap">
+  {
+    "imports": {
+      "@codemirror/state": "https://cdn.jsdelivr.net/npm/@codemirror/state@6.4.1/+esm",
+      "@codemirror/view": "https://cdn.jsdelivr.net/npm/@codemirror/view@6.26.3/+esm",
+      "@codemirror/commands": "https://cdn.jsdelivr.net/npm/@codemirror/commands@6.6.0/+esm",
+      "@codemirror/language": "https://cdn.jsdelivr.net/npm/@codemirror/language@6.10.2/+esm",
+      "@codemirror/lang-cpp": "https://cdn.jsdelivr.net/npm/@codemirror/lang-cpp@6.0.2/+esm",
+      "codemirror": "https://cdn.jsdelivr.net/npm/codemirror@6.0.1/+esm"
+    }
+  }
+  </script>
+
   <!-- App modules. Order matters: engines first, orchestrator last. -->
   <script src="dsaEngine.js"></script>
   <script src="render3d.js"></script>
   <script src="vision.js"></script>
   <script src="speech.js"></script>
+  <script src="sandbox.js"></script>
   <script src="app.js"></script>
+
+  <!-- CodeMirror bootstrap (module). Builds the editor and exposes a tiny shim
+       on window.__cppEditor: { getValue(), setValue(str) }. If the CDN import
+       fails for any reason, we fall back to a plain <textarea> with the same
+       shim so "Run C++" always works. app.js polls window.__cppEditorReady. -->
+  <script type="module">
+    const DEFAULT_CPP = `// Recursive Fibonacci — drives the 3D call stack via @VIS.
+// cout lines starting with @VIS: are parsed by the visualizer;
+// everything else prints to the terminal below.
+#include <iostream>
+using namespace std;
+
+int fib(int n) {
+    cout << "@VIS:CALL:fib(" << n << "):n=" << n << endl;
+    cout << "@VIS:LINE:9" << endl;
+    if (n < 2) {
+        cout << "@VIS:RET:" << n << endl;
+        return n;
+    }
+    int a = fib(n - 1);
+    int b = fib(n - 2);
+    cout << "@VIS:RET:" << (a + b) << endl;
+    return a + b;
+}
+
+int main() {
+    // Build a tiny graph too, so nodes + call stack show together.
+    cout << "@VIS:NODE:1:0" << endl;
+    cout << "@VIS:NODE:2:1" << endl;
+    cout << "@VIS:EDGE:1:2" << endl;
+    int r = fib(4);
+    cout << "fib(4) = " << r << endl;
+    return 0;
+}
+`;
+
+    const mount = document.getElementById('cmEditor');
+
+    function installTextareaFallback(reason) {
+      mount.innerHTML = '';
+      const ta = document.createElement('textarea');
+      ta.className = 'cm-fallback';
+      ta.spellcheck = false;
+      ta.value = DEFAULT_CPP;
+      mount.appendChild(ta);
+      window.__cppEditor = {
+        getValue: () => ta.value,
+        setValue: (s) => { ta.value = s; },
+      };
+      if (reason) console.warn('[sandbox] CodeMirror unavailable, using textarea:', reason);
+      window.__cppEditorReady = true;
+    }
+
+    try {
+      const [{ EditorView, basicSetup }, { cpp }, { EditorState }] = await Promise.all([
+        import('codemirror'),
+        import('@codemirror/lang-cpp'),
+        import('@codemirror/state'),
+      ]);
+      const view = new EditorView({
+        state: EditorState.create({ doc: DEFAULT_CPP, extensions: [basicSetup, cpp()] }),
+        parent: mount,
+      });
+      window.__cppEditor = {
+        getValue: () => view.state.doc.toString(),
+        setValue: (s) =>
+          view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: s } }),
+      };
+      window.__cppEditorReady = true;
+    } catch (err) {
+      installTextareaFallback(err && err.message);
+    }
+  </script>
 </body>
 </html>

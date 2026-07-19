@@ -340,6 +340,47 @@ html, body {
 @keyframes spin { to { transform: rotate(360deg); } }
 .btn-big { flex: none; margin-top: 18px; padding: 12px 28px; font-size: 14px; }
 
+/* ===================== Custom C++ sandbox ===================== */
+.btn-accent { background: var(--green); color: #04120c; }
+.btn-accent:hover { box-shadow: 0 0 16px rgba(0,255,156,.45); }
+.btn:disabled { opacity: .4; cursor: not-allowed; transform: none; box-shadow: none; }
+
+.cm-mount {
+  margin: 8px 12px 0; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg); overflow: hidden; max-height: 260px;
+}
+/* CodeMirror sits inside .cm-mount; keep it monospaced + scrollable. */
+.cm-mount .cm-editor { max-height: 260px; font-family: var(--mono); font-size: 12px; }
+.cm-mount .cm-scroller { overflow: auto; }
+.cm-mount .cm-editor.cm-focused { outline: none; }
+/* Textarea fallback mirrors the editor box when CodeMirror can't load. */
+.cm-fallback {
+  width: 100%; min-height: 200px; box-sizing: border-box; resize: vertical;
+  background: var(--bg); color: var(--text); border: none; padding: 8px 10px;
+  font-family: var(--mono); font-size: 12px; line-height: 1.5;
+}
+.cm-fallback:focus { outline: none; }
+
+.sandbox-actions { display: flex; gap: 8px; padding: 8px 12px 0; }
+
+.cpp-terminal {
+  margin: 8px 12px 4px; padding: 8px 10px; border: 1px solid var(--line);
+  border-radius: 6px; background: #05080a; max-height: 150px; overflow-y: auto;
+  font-family: var(--mono); font-size: 11px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word; color: var(--text-dim);
+}
+.cpp-terminal:empty { display: none; }
+.cpp-terminal .t-out { color: var(--green); }
+.cpp-terminal .t-err { color: var(--red); }
+.cpp-terminal .t-ok  { color: var(--cyan); }
+.cpp-terminal .t-dim { color: var(--text-dim); }
+.cpp-terminal .t-line { display: block; }
+
+.sandbox-card .hint code {
+  color: var(--cyan); background: rgba(0,243,255,.08);
+  padding: 0 3px; border-radius: 3px; font-size: 10px;
+}
+
 /* Responsive: stack on narrow screens */
 @media (max-width: 860px) {
   .dashboard { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }

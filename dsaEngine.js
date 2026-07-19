@@ -256,6 +256,10 @@ class DSAEngine {
 
     /** Optional observers notified whenever the presented model changes. */
     this._listeners = new Set();
+
+    /** Custom C++ sandbox: the user's own source listing + live model. */
+    this._sandboxSource = [];
+    this._sandboxModel = { nodes: [], edges: [] };
   }
 
   /* --------------------------------------------------------------------- */
@@ -348,7 +352,7 @@ class DSAEngine {
   }
 
   setActiveAlgorithm(key) {
-    if (!CPP_SOURCES[key] && key !== 'bst' && key !== 'graph') {
+    if (!CPP_SOURCES[key] && key !== 'bst' && key !== 'graph' && key !== 'customCpp') {
       console.warn('[dsaEngine] unknown algorithm key:', key);
     }
     this.activeAlgorithm = key;
@@ -356,6 +360,8 @@ class DSAEngine {
   }
 
   getSource(key = this.activeAlgorithm) {
+    // The custom sandbox supplies its own listing at runtime.
+    if (key === 'customCpp') return this._sandboxSource || [];
     return CPP_SOURCES[key] || [];
   }
 
@@ -1733,6 +1739,133 @@ class DSAEngine {
 
     this._recBegin(model, ALGO);
     dfs(start);
+  }
+
+  /* ===================================================================== */
+  /* CUSTOM C++ SANDBOX authoring API                                      */
+  /* ---------------------------------------------------------------------
+   * sandbox.js runs the user's C++ through JSCPP and streams `@VIS:` commands
+   * here. Unlike the built-in algorithms (which build their whole trace in one
+   * synchronous pass), the sandbox drives us INCREMENTALLY — one snapshot per
+   * intercepted command — while the interpreter runs in a Web Worker.
+   *
+   * The trick that lets graph nodes AND a call stack coexist in one run: we
+   * point the recursion bookkeeping's `model` at a single shared `_sandboxModel`.
+   * Every call/line snapshot therefore deep-clones the current nodes and edges
+   * alongside the call frame — the two layers ride together for free, and
+   * reverse-stepping stays lossless (each entry is a full snapshot).
+   * ------------------------------------------------------------------ */
+
+  /** Point getSource('customCpp') at the user's own C++ listing. */
+  setSandboxSource(lines) {
+    this._sandboxSource = Array.isArray(lines) ? lines.slice() : [];
+  }
+
+  /**
+   * Begin a sandbox trace. Wipes the history and the sandbox model, arms the
+   * shared recursion bookkeeping against that model, and switches the active
+   * algorithm so the code panel shows the user's C++.
+   */
+  sandboxBegin() {
+    this._resetTrace();
+    this.activeAlgorithm = 'customCpp';
+    this._sandboxModel = { nodes: [], edges: [] };
+    this._sandboxCount = 0;
+    // Reuse the recursion tracker, but record against the sandbox model so
+    // nodes/edges are captured in every frame snapshot too.
+    this._recBegin(this._sandboxModel, 'customCpp');
+  }
+
+  /** id of the current top-of-stack frame, or null when the stack is empty. */
+  _sandboxActiveId() {
+    const st = this._rec && this._rec.stack;
+    return st && st.length ? st[st.length - 1] : null;
+  }
+
+  /** Record one sandbox snapshot with the current model + call-frame state. */
+  _sandboxRecord(line, desc, event, returnValue) {
+    this._record(
+      this._sandboxModel,
+      typeof line === 'number' ? line : -1,
+      desc,
+      'customCpp',
+      this._recFrame(event, this._sandboxActiveId(), returnValue)
+    );
+  }
+
+  /**
+   * @VIS:NODE — spawn a node carrying `value`, laid out on a loose outward
+   * spiral so hand-authored graphs never stack on the origin. Returns its uuid
+   * so sandbox.js can map the C++ integer id onto it.
+   */
+  sandboxNode(value, line) {
+    const i = this._sandboxCount++;
+    const angle = i * 2.399963;                 // golden-angle spread
+    const r = 2.2 + i * 0.55;
+    const node = {
+      uuid: generateUUID(),
+      value,
+      position: { x: Math.cos(angle) * r, y: Math.sin(angle) * r * 0.62, z: 0 },
+      state: 'added',
+    };
+    this._sandboxModel.nodes.push(node);
+    this._sandboxRecord(line, `Create node ${value}`, 'line');
+    return node.uuid;
+  }
+
+  /** @VIS:EDGE — connect two existing sandbox nodes (directed). No-op on dup. */
+  sandboxEdge(fromUuid, toUuid, line) {
+    if (!fromUuid || !toUuid || fromUuid === toUuid) return null;
+    const dup = this._sandboxModel.edges.some(
+      (e) => e.from === fromUuid && e.to === toUuid
+    );
+    if (dup) return null;
+    const edge = {
+      uuid: generateUUID(),
+      from: fromUuid, to: toUuid,
+      directed: true, weight: 1, state: 'path',
+    };
+    this._sandboxModel.edges.push(edge);
+    this._sandboxRecord(line, 'Connect nodes', 'line');
+    return edge;
+  }
+
+  /** @VIS:CALL — push a call frame (stack tower + call tree grow). */
+  sandboxCall(label, argsText, line) {
+    const args = argsText ? [{ name: 'args', value: argsText }] : [];
+    return this.emitCallEnter(
+      typeof line === 'number' ? line : -1,
+      label || 'call', args, [], `Call ${label || ''}`.trim()
+    );
+  }
+
+  /** @VIS:RET — pop the top call frame with a return value (unwind). */
+  sandboxReturn(value, line) {
+    if (!this._rec || !this._rec.stack.length) {
+      // Return with nothing on the stack: record a bare snapshot so the step is
+      // still navigable rather than throwing.
+      this._sandboxRecord(line, `Return ${value}`, 'return', value);
+      return value;
+    }
+    return this.emitCallReturn(
+      typeof line === 'number' ? line : -1, value, `Return ${value}`
+    );
+  }
+
+  /** @VIS:LINE — highlight a source line within the current frame. */
+  sandboxLine(lineIndex, desc) {
+    this._sandboxRecord(lineIndex, desc || 'Execute line', 'line');
+  }
+
+  /**
+   * Finish a sandbox run: arm the history cursor at step 0 (if anything was
+   * recorded) and emit once so the UI shows the first frame. Returns the step
+   * count, mirroring buildTrace()'s contract.
+   */
+  sandboxEnd() {
+    if (this.algorithmHistory.length > 0) this.historyIndex = 0;
+    this._emit();
+    return this.algorithmHistory.length;
   }
 }
 

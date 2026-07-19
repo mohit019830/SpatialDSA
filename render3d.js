@@ -1531,6 +1531,49 @@
       this.grid.visible = true;
     }
 
+    /* -------------------------------------------------------------------
+     * CUSTOM C++ SANDBOX overlay
+     * -------------------------------------------------------------------
+     * A sandbox run can emit BOTH graph nodes/edges AND a call stack. Plain
+     * recursion mode hides the DS layer; the sandbox instead keeps nodes,
+     * edges, and grid fully visible and overlays ONLY the camera-parented
+     * stack tower on top. Because the tower is a child of the camera it stays
+     * pinned to the corner of the screen while the graph orbits underneath.
+     * ---------------------------------------------------------------- */
+    enterSandboxMode() {
+      if (!this._recTreeGroup) this._buildRecursion();
+      this._sandboxActive = true;
+      this._recActive = false;      // NOT recursion mode — DS layer stays live
+      this._recMode = 'stack';      // sandbox always uses the tower overlay
+      this._recLastStepIndex = -1;
+      this._recPrevFrame = null;
+      this._recLastFrame = null;
+      this._recBubbleAnim = null;
+      this._recStackAnim = null;
+
+      // DS layer visible; call tree hidden; stack tower shown as the overlay.
+      for (const g of this.nodeMeshes.values()) g.visible = true;
+      for (const g of this.edgeMeshes.values()) g.visible = true;
+      this.grid.visible = true;
+      this._recTreeGroup.visible = false;
+      this._recStackGroup.visible = true;
+
+      // Gentle head-on framing so both the graph and the tower read well; the
+      // user can still pinch/drag to orbit the graph.
+      this.autoRotate = false;
+      this._camTarget.set(0, 3, 34);
+    }
+
+    /** Leave sandbox overlay: hide the tower, DS layer already visible. */
+    exitSandboxMode() {
+      this._sandboxActive = false;
+      if (this._recStackGroup) this._recStackGroup.visible = false;
+      if (this._recTreeGroup) this._recTreeGroup.visible = false;
+      this._recNodePool && this._recNodePool.forEach((g) => (g.visible = false));
+      this._recBlockPool && this._recBlockPool.forEach((b) => (b.visible = false));
+      if (this._recBubble) this._recBubble.visible = false;
+    }
+
     /**
      * Render a single call-frame snapshot (from the engine). The snapshot is the
      * authoritative state: it is applied instantly and idempotently, so trace
@@ -1943,6 +1986,10 @@
         this.renderer.render(this.scene, this.camera);
         return;
       }
+
+      // Sandbox overlay: the DS layer renders normally (below), but the camera-
+      // parented stack tower still needs its per-frame flourish animation ticked.
+      if (this._sandboxActive) this._updateRecursion(t);
 
       // Lerp node transforms toward targets for smooth structural motion.
       for (const group of this.nodeMeshes.values()) {
