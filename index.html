@@ -172,6 +172,11 @@
           <span id="cppStatus" class="desc-badge">idle</span>
         </div>
         <div id="cmEditor" class="cm-mount" aria-label="C++ source editor"></div>
+        <label class="stdin-label" for="cppStdin">standard input (stdin)</label>
+        <textarea id="cppStdin" class="cpp-stdin" spellcheck="false"
+          autocomplete="off" autocorrect="off" autocapitalize="off" wrap="off"
+          aria-label="Standard input test cases"
+          placeholder="Paste standard input (test cases) here…"></textarea>
         <div class="sandbox-actions">
           <button id="btnRunCpp" class="btn btn-accent">▶ Run C++</button>
           <button id="btnStopCpp" class="btn" disabled>■ Stop</button>
@@ -182,8 +187,10 @@
           Drive the visualizer from C++ with <code>cout</code>:
           <code>@VIS:NODE:id:value</code>, <code>@VIS:EDGE:idA:idB</code>,
           <code>@VIS:CALL:label:args</code>, <code>@VIS:RET:value</code>,
-          <code>@VIS:LINE:n</code>. Runs in a sandboxed worker (5s cap). JSCPP
-          supports core C++ + arrays + recursion; most STL is unavailable.
+          <code>@VIS:LINE:n</code>. Read test cases from the stdin box above with
+          <code>cin</code> / <code>scanf</code> / <code>getline</code>. Runs in a
+          sandboxed worker (5s cap). JSCPP supports core C++ + arrays + recursion;
+          most STL is unavailable.
         </p>
       </section>
     </aside>

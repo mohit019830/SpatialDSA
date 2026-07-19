@@ -78,6 +78,7 @@
     // custom C++ sandbox
     cppStatus: $('#cppStatus'),
     cppTerminal: $('#cppTerminal'),
+    cppStdin: $('#cppStdin'),
     btnRunCpp: $('#btnRunCpp'),
     btnStopCpp: $('#btnStopCpp'),
     btnCppExample: $('#btnCppExample'),
@@ -1228,6 +1229,7 @@
       getRenderer: () => renderer,
       getCode: () =>
         (window.__cppEditor ? window.__cppEditor.getValue() : ''),
+      getStdin: () => (els.cppStdin ? els.cppStdin.value : ''),
       hooks: {
         onStatus: (kind, text) => setCppStatus(kind, text),
         onTerminal: (text, kind) => appendTerminal(text, kind),
@@ -1266,37 +1268,50 @@
 
     els.btnCppExample.addEventListener('click', () => {
       if (window.__cppEditor) window.__cppEditor.setValue(EXAMPLE_CPP);
-      appendTerminal('Loaded example: recursive Fibonacci + graph.', 'dim');
+      if (els.cppStdin) els.cppStdin.value = EXAMPLE_STDIN;
+      appendTerminal('Loaded example: reads a graph (N, E, edges) from stdin.', 'dim');
     });
   }
 
   // A second, graph-flavored example the "Load Example" button can restore to.
-  const EXAMPLE_CPP = `// Build a binary tree as a graph, then walk it recursively.
+  // Competitive-Companion style: the whole graph comes from stdin. Read N (nodes)
+  // and E (edges), then E lines of "u v", and emit @VIS commands purely from the
+  // parsed input. Paste different test cases in the stdin box and re-run — no
+  // code changes needed.
+  const EXAMPLE_CPP = `// Reads a graph from stdin and visualizes it.
+// Input:  first line "N E", then E lines each "u v".
 #include <iostream>
 using namespace std;
 
-// Emit a node (id == value here) and connect it to its parent.
-void node(int id) { cout << "@VIS:NODE:" << id << ":" << id << endl; }
-void edge(int a, int b) { cout << "@VIS:EDGE:" << a << ":" << b << endl; }
-
-void visit(int id, int depth) {
-    cout << "@VIS:CALL:visit(" << id << "):depth=" << depth << endl;
-    if (depth < 3) {
-        int l = id * 2, r = id * 2 + 1;
-        node(l); edge(id, l);
-        node(r); edge(id, r);
-        visit(l, depth + 1);
-        visit(r, depth + 1);
-    }
-    cout << "@VIS:RET:" << id << endl;
-}
-
 int main() {
-    node(1);
-    visit(1, 1);
-    cout << "tree built" << endl;
+    int n, e;
+    cin >> n >> e;                 // node count, edge count
+
+    // Create N nodes (id == value == index).
+    for (int i = 0; i < n; i++) {
+        cout << "@VIS:NODE:" << i << ":" << i << endl;
+    }
+
+    // Read E edges and connect them.
+    for (int k = 0; k < e; k++) {
+        int u, v;
+        cin >> u >> v;
+        cout << "@VIS:EDGE:" << u << ":" << v << endl;
+    }
+
+    cout << "built " << n << " nodes, " << e << " edges" << endl;
     return 0;
 }
+`;
+
+  // Default test case that pairs with EXAMPLE_CPP: 5 nodes, 5 edges (a little
+  // cycle with a tail). Loaded into the stdin box alongside the example.
+  const EXAMPLE_STDIN = `5 5
+0 1
+1 2
+2 0
+2 3
+3 4
 `;
 
   function wireLinearAlgebra() {

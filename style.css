@@ -361,6 +361,26 @@ html, body {
 }
 .cm-fallback:focus { outline: none; }
 
+/* stdin box — mirrors the terminal's dark monospace look. Competitive-Companion
+   style: paste raw test cases here, read them from C++ with cin/scanf/getline. */
+.stdin-label {
+  display: block; margin: 10px 12px 0; font-size: 10px; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--text-dim);
+}
+.cpp-stdin {
+  display: block; box-sizing: border-box; width: calc(100% - 24px);
+  margin: 4px 12px 0; padding: 8px 10px; resize: vertical;
+  min-height: 56px; max-height: 180px;
+  border: 1px solid var(--line); border-radius: 6px; background: #05080a;
+  color: var(--text); font-family: var(--mono); font-size: 11px; line-height: 1.5;
+  white-space: pre; overflow: auto; tab-size: 4;
+}
+.cpp-stdin::placeholder { color: var(--text-dim); opacity: .7; }
+.cpp-stdin:focus {
+  outline: none; border-color: var(--green);
+  box-shadow: 0 0 0 1px rgba(0,255,156,.25);
+}
+
 .sandbox-actions { display: flex; gap: 8px; padding: 8px 12px 0; }
 
 .cpp-terminal {

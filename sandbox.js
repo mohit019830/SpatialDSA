@@ -71,12 +71,15 @@
       self.onmessage = function (ev) {
         var code = ev.data && ev.data.code;
         if (typeof code !== 'string') return;
+        // stdin: the raw test-case string. JSCPP.run(code, input, config) feeds
+        // it to cin/scanf/getline. Default to '' when the box is empty.
+        var stdin = (ev.data && typeof ev.data.stdin === 'string') ? ev.data.stdin : '';
         var config = {
           stdio: { write: function (s) { self.postMessage({ type: 'stdout', chunk: s }); } },
           maxTimeout: ${maxTimeout}
         };
         try {
-          var ret = JSCPP.run(code, '', config);
+          var ret = JSCPP.run(code, stdin, config);
           self.postMessage({ type: 'exit', code: ret });
         } catch (e) {
           self.postMessage({ type: 'error', message: (e && e.message) ? e.message : String(e) });
@@ -92,12 +95,14 @@
      * @param {DSAEngine} opts.engine   the shared engine instance
      * @param {() => Renderer3D} opts.getRenderer  late-bound renderer accessor
      * @param {() => string} opts.getCode   reads the editor (CodeMirror or textarea)
+     * @param {() => string} opts.getStdin  reads the stdin box (test-case input)
      * @param {object} opts.hooks   { onStatus, onTerminal, onRunStart, onRunEnd }
      */
     constructor(opts) {
       this.engine = opts.engine;
       this.getRenderer = opts.getRenderer || (() => null);
       this.getCode = opts.getCode;
+      this.getStdin = opts.getStdin || (() => '');
       this.hooks = opts.hooks || {};
 
       this._worker = null;
@@ -121,6 +126,13 @@
         return;
       }
 
+      // Standard input (test cases). Normalize CRLF → LF so cin/getline see the
+      // line breaks JSCPP expects, and guarantee a trailing newline so the final
+      // token/line is delimited — otherwise a bare "5" can read short of EOF.
+      let stdin = (this.getStdin ? this.getStdin() : '') || '';
+      stdin = stdin.replace(/\r\n/g, '\n');
+      if (stdin.length && !stdin.endsWith('\n')) stdin += '\n';
+
       this._running = true;
       this._lineBuf = '';
       this._idMap.clear();
@@ -138,9 +150,11 @@
       this._status('loading', 'running…');
       this._term('▶ Running C++ in sandboxed worker…', 'dim');
 
+      if (stdin.length) this._term(`↳ stdin: ${stdin.split('\n').length - 1} line(s) fed to cin.`, 'dim');
+
       // Spawn the worker.
       try {
-        this._spawnWorker(code);
+        this._spawnWorker(code, stdin);
       } catch (e) {
         this._running = false;
         this._status('error', 'worker failed');
@@ -159,7 +173,7 @@
 
     /* ---- worker plumbing ------------------------------------------- */
 
-    _spawnWorker(code) {
+    _spawnWorker(code, stdin) {
       const src = workerSource(JSCPP_CDN, JSCPP_MAXTIMEOUT_MS);
       const blob = new Blob([src], { type: 'application/javascript' });
       const url = URL.createObjectURL(blob);
@@ -179,7 +193,7 @@
         this._finish(false);
       }, HARD_TIMEOUT_MS);
 
-      w.postMessage({ code });
+      w.postMessage({ code, stdin: stdin || '' });
     }
 
     _onWorkerMessage(msg) {
