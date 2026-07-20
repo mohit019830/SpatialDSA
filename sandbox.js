@@ -48,8 +48,14 @@
 (function () {
   'use strict';
 
-  // Pinned JSCPP build. The worker importScripts() this exact URL.
-  const JSCPP_CDN = 'https://cdn.jsdelivr.net/npm/JSCPP@2.0.2/dist/JSCPP.es5.min.js';
+  // Pinned JSCPP build. The worker importScripts() this EXACT URL — do not float
+  // to a version range or @latest. The automatic Stack Tower depends on JSCPP's
+  // undocumented internal runtime shape (rt.scope, frames named "function <name>"),
+  // which is only verified against 2.0.2. A minor bump can silently change it, at
+  // which point readStack() degrades to line-only tracing (no tower). Keep the
+  // version string and the assert in the worker in lockstep if you ever re-pin.
+  const JSCPP_VERSION = '2.0.2';
+  const JSCPP_CDN = `https://cdn.jsdelivr.net/npm/JSCPP@${JSCPP_VERSION}/dist/JSCPP.es5.min.js`;
 
   // Hard wall-clock ceiling. JSCPP's maxTimeout only checks between operations,
   // so a tight empty loop can slip past it — this terminate() is the real guard.
@@ -139,6 +145,14 @@
           return;
         }
 
+        // Probe the undocumented stack shape ONCE up front so the user gets an
+        // early, explicit signal on the first run: readStack returns [] (readable,
+        // no function frames yet) when the internal shape is intact, or null when
+        // it isn't. null → the Stack Tower won't build; we degrade to line-only.
+        if (readStack(dbg) === null) {
+          self.postMessage({ type: 'note', message: 'Stack introspection unavailable (JSCPP internals changed?) — tracing lines only, no Stack Tower.' });
+        }
+
         var done = false, raw = 0, emitted = 0, lastSig = null;
         while (raw < ${maxRaw}) {
           var node = null;
@@ -204,6 +218,7 @@
       this._cmdCount = 0;        // manual @VIS commands applied
       this._stepCount = 0;       // automatic debugger steps applied
       this._stackDepth = 0;      // current mirrored call-stack depth
+      this._stackNames = [];     // last-seen frame names (to name popped frames)
       this._running = false;
     }
 
@@ -235,6 +250,7 @@
       this._cmdCount = 0;
       this._stepCount = 0;
       this._stackDepth = 0;
+      this._stackNames = [];
 
       // Prime the engine: reset, show the user's listing, enter sandbox trace.
       this.engine.setSandboxSource(code.split('\n'));
@@ -401,6 +417,7 @@
     _applyStep(line, stack) {
       const eng = this.engine;
       const ln = (typeof line === 'number' ? line : 0) - 1; // → 0-based
+      const oneBased = (typeof line === 'number') ? line : null;
 
       if (Array.isArray(stack)) {
         const depth = stack.length;
@@ -408,20 +425,42 @@
           // One CALL per new frame (usually one, but guard for jumps).
           for (let d = this._stackDepth; d < depth; d++) {
             eng.sandboxCall(stack[d] || 'fn', '', ln);
+            this._traceDepth('call', d + 1, stack[d] || 'fn', oneBased);
           }
         } else if (depth < this._stackDepth) {
           for (let d = this._stackDepth; d > depth; d--) {
             eng.sandboxReturn('', ln);
+            // The popped frame is gone from `stack`; name it from the PREVIOUS
+            // step's names (index d-1), which we cached last tick.
+            const name = this._stackNames[d - 1] || 'fn';
+            this._traceDepth('return', d, name, oneBased);
           }
         } else {
           eng.sandboxLine(ln, 'Execute line');
         }
         this._stackDepth = depth;
+        this._stackNames = stack.slice();   // cache for naming the next pop
       } else {
         // No stack introspection available — degrade to line highlighting only.
         eng.sandboxLine(ln, 'Execute line');
       }
       this._stepCount++;
+    }
+
+    /**
+     * Trace-depth indicator: prints a call/return line to the terminal on every
+     * stack transition, indented to match depth, so the Stack Tower's build/unwind
+     * rhythm is easy to sanity-check against the 3D scene while testing.
+     *   depth 1  → enter main
+     *     depth 2  → enter dfs        @ L10
+     *     depth 2  ← return dfs       @ L18
+     *   depth 1  ← return main
+     */
+    _traceDepth(kind, depth, name, line) {
+      const indent = '  '.repeat(Math.max(0, depth - 1));
+      const arrow = kind === 'call' ? '→ enter ' : '← return ';
+      const at = (typeof line === 'number') ? `  @ L${line}` : '';
+      this._term(`${indent}${arrow}${name}  ·depth ${depth}${at}`, 'dim');
     }
 
     _killWorker() {

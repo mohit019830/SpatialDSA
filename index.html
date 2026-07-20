@@ -245,7 +245,10 @@
   <!-- CodeMirror 6 is ESM-only (no UMD bundle), so it loads via an import map +
        a module bootstrap below. JSCPP itself is NOT loaded here — sandbox.js
        importScripts() it inside the Web Worker so a runaway program can't block
-       the main thread. -->
+       the main thread.
+       IMPORTANT: JSCPP is pinned to EXACTLY 2.0.2 in sandbox.js (JSCPP_CDN). The
+       automatic Stack Tower reads an undocumented internal (rt.scope); a version
+       bump could silently break it. Do not float that pin to a range/@latest. -->
   <script type="importmap">
   {
     "imports": {
