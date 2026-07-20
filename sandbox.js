@@ -98,22 +98,77 @@
         self.postMessage({ type: 'done' });
       }
 
-      // Read the C++ call stack off JSCPP's internal runtime. Undocumented, so
-      // guarded: any deviation from the expected shape returns null → the main
-      // thread falls back to line-only tracing instead of crashing.
-      function readStack(dbg) {
+      // Stringify one JSCPP variable cell {t,v} to a short display value, or null
+      // if it isn't worth showing (function pointers, streams, aggregates). NOTE:
+      // makeValueString returns a NUMBER for int/double cells, so we String()-coerce
+      // rather than reject non-strings — that was the bug that blanked every value.
+      function valStr(rt, val) {
         try {
-          var scope = dbg && dbg.rt && dbg.rt.scope;
+          var ts = rt.makeTypeString(val.t);
+          if (typeof ts === 'string' && ts.indexOf('(*f)') >= 0) return null; // fn ptr
+          var s = rt.makeValueString(val);
+          if (s == null) return null;
+          s = String(s);
+          if (s === '<object>') return null; // cin/cout/endl and other opaque objects
+          return s.length > 40 ? s.slice(0, 39) + '…' : s;
+        } catch (e) { return null; }
+      }
+
+      // Read the C++ call stack + per-frame variables off JSCPP's internal runtime
+      // (dbg.rt.scope). Undocumented and guarded: any deviation returns null → the
+      // main thread degrades to line-only tracing instead of crashing.
+      //
+      // Scope layout (verified against JSCPP 2.0.2): rt.scope is an array, bottom
+      // (global) → top. A "function <name>" scope opens a call frame; its own cell
+      // holds the ARGUMENTS, and the block scopes that follow it (CompoundStatement,
+      // SelectionStatement_if, IterationStatement_for, …) hold that frame's LOCALS —
+      // until the next "function <name>" opens the child frame. We fold all those
+      // into the current frame. Returns [{label, vars:[{name,value}]}] bottom→top.
+      function readFrames(dbg) {
+        try {
+          var rt = dbg && dbg.rt;
+          var scope = rt && rt.scope;
           if (!Array.isArray(scope)) return null;
-          var out = [];
+          var frames = [];
+          var cur = null;
           for (var i = 0; i < scope.length; i++) {
-            var nm = scope[i] && scope[i]['$name'];
+            var sc = scope[i];
+            var nm = sc && sc['$name'];
             if (typeof nm === 'string' && nm.indexOf('function ') === 0) {
-              out.push(nm.slice(9)); // strip "function " → bare C++ function name
+              cur = { label: nm.slice(9), vars: [] };
+              frames.push(cur);
+            }
+            if (!cur) continue; // skip the global scope's builtins (cin/cout/funcs)
+            for (var key in sc) {
+              if (key === '$name') continue;
+              var val = sc[key];
+              if (val && typeof val === 'object' && ('t' in val) && ('v' in val)) {
+                var vs = valStr(rt, val);
+                if (vs === null) continue;
+                var dup = false;
+                for (var d = 0; d < cur.vars.length; d++) {
+                  if (cur.vars[d].name === key) { dup = true; break; }
+                }
+                if (!dup) cur.vars.push({ name: key, value: vs });
+              }
             }
           }
-          return out;
+          return frames;
         } catch (e) { return null; }
+      }
+
+      // Count active C++ function frames (the "call depth"). main == 1.
+      function funcDepth(dbg) {
+        try {
+          var scope = dbg && dbg.rt && dbg.rt.scope;
+          if (!Array.isArray(scope)) return 0;
+          var d = 0;
+          for (var i = 0; i < scope.length; i++) {
+            var nm = scope[i] && scope[i]['$name'];
+            if (typeof nm === 'string' && nm.indexOf('function ') === 0) d++;
+          }
+          return d;
+        } catch (e) { return 0; }
       }
 
       self.onmessage = function (ev) {
@@ -145,12 +200,57 @@
           return;
         }
 
-        // Probe the undocumented stack shape ONCE up front so the user gets an
-        // early, explicit signal on the first run: readStack returns [] (readable,
+        // Probe the undocumented scope shape ONCE up front so the user gets an
+        // early, explicit signal on the first run: readFrames returns [] (readable,
         // no function frames yet) when the internal shape is intact, or null when
         // it isn't. null → the Stack Tower won't build; we degrade to line-only.
-        if (readStack(dbg) === null) {
+        if (readFrames(dbg) === null) {
           self.postMessage({ type: 'note', message: 'Stack introspection unavailable (JSCPP internals changed?) — tracing lines only, no Stack Tower.' });
+        }
+
+        // RETURN-VALUE CAPTURE. The debugger's public stepping (next/nextNode)
+        // swallows the value a function returns — dbg.next() just yields false
+        // until the whole program ends. The ONE reliable interception point
+        // (verified against 2.0.2) is the return-statement visitor itself, which
+        // evaluates to ["return", {t,v}] the instant the value is computed. We wrap
+        // it and push each value onto a FIFO. Returns fire innermost-first — the
+        // same order frames pop — so the main thread consumes the queue one value
+        // per detected pop and the two stay aligned. Guarded: if the visitor table
+        // isn't shaped as expected, we simply capture nothing (bubbles show blank).
+        var retQueue = [];      // captured return values, oldest first
+        try {
+          var interp = dbg.rt && dbg.rt.interp;
+          var vis = interp && interp.visitors;
+          if (vis && typeof vis.JumpStatement_return === 'function') {
+            var origRet = vis.JumpStatement_return;
+            vis.JumpStatement_return = function* (i2, s2, p2) {
+              var r = yield* origRet.call(this, i2, s2, p2);
+              try {
+                if (r && r.length && r[0] === 'return' && r[1] && ('t' in r[1])) {
+                  var vs = valStr(dbg.rt, r[1]);
+                  retQueue.push(vs === null ? '' : vs);
+                } else if (r && r[0] === 'return') {
+                  retQueue.push('');   // void return — still a pop
+                }
+              } catch (e) {}
+              return r;
+            };
+          }
+        } catch (e) { /* no capture; bubbles will be blank but tree still builds */ }
+
+        // Signature of a frame list, used to coalesce steps: emit a new snapshot
+        // only when the line, the call depth, OR any visible variable changed —
+        // so assignments like "int a = …" produce a step even on the same line.
+        function framesSig(frames) {
+          if (!frames) return '?';
+          var parts = [];
+          for (var i = 0; i < frames.length; i++) {
+            var f = frames[i];
+            var vs = [];
+            for (var j = 0; j < f.vars.length; j++) vs.push(f.vars[j].name + '=' + f.vars[j].value);
+            parts.push(f.label + '(' + vs.join(',') + ')');
+          }
+          return parts.join('>');
         }
 
         var done = false, raw = 0, emitted = 0, lastSig = null;
@@ -158,12 +258,17 @@
           var node = null;
           try { node = dbg.nextNode(); } catch (e) { node = null; }
           var line = (node && typeof node.sLine === 'number') ? node.sLine : null;
-          var stack = readStack(dbg);
+          var frames = readFrames(dbg);
 
-          if (line !== null) {
-            var sig = line + '|' + (stack ? stack.join('>') : '?');
+          if (line !== null && line > 0) {
+            var sig = line + '|' + framesSig(frames);
             if (sig !== lastSig) {
-              self.postMessage({ type: 'step', line: line, stack: stack });
+              // Hand over any return values captured since the last emitted step,
+              // in fire order (innermost-first = pop order). The main thread pairs
+              // them with the pops it detects from the depth drop.
+              var returns = retQueue;
+              retQueue = [];
+              self.postMessage({ type: 'step', line: line, frames: frames, returns: returns });
               lastSig = sig;
               if (++emitted >= ${maxEmit}) {
                 self.postMessage({ type: 'note', message: 'Step limit (' + ${maxEmit} + ') reached — trace truncated.' });
@@ -219,6 +324,9 @@
       this._stepCount = 0;       // automatic debugger steps applied
       this._stackDepth = 0;      // current mirrored call-stack depth
       this._stackNames = [];     // last-seen frame names (to name popped frames)
+      this._lastFrames = [];     // last-seen full frame snapshot (label + vars)
+      this._lastReturn = null;   // best-effort return value for the next pop
+      this._retQueue = [];       // captured return values awaiting their pops (FIFO)
       this._running = false;
     }
 
@@ -251,6 +359,8 @@
       this._stepCount = 0;
       this._stackDepth = 0;
       this._stackNames = [];
+      this._lastFrames = [];
+      this._retQueue = [];
 
       // Prime the engine: reset, show the user's listing, enter sandbox trace.
       this.engine.setSandboxSource(code.split('\n'));
@@ -380,7 +490,7 @@
       if (!msg || !this._running) return;
       switch (msg.type) {
         case 'step':
-          this._applyStep(msg.line, msg.stack);
+          this._applyStep(msg.line, msg.frames, msg.returns);
           break;
         case 'stdout':
           this._ingest(msg.chunk);
@@ -405,46 +515,96 @@
 
     /**
      * Apply one automatic debugger step. `line` is 1-based (engine wants 0-based);
-     * `stack` is the array of active C++ function names (deepest last), or null if
-     * the runtime introspection failed (→ line-only, no stack tower changes).
+     * `frames` is the live C++ call stack bottom→top, each {label, vars:[{name,
+     * value}]}, or null if runtime introspection failed (→ line-only, no tower).
+     * `returns` is the FIFO of return values captured by the worker since the last
+     * step, in fire order (innermost-first = pop order), so we consume one per
+     * detected pop and the value lands on the frame that actually returned.
      *
-     * We reconcile our mirrored call-stack depth against the reported one:
-     *   deeper  → CALL frames pushed (function entered / recursed)
-     *   shallower → RET frames popped (functions returned)
-     *   same    → a plain LINE step within the current frame.
-     * This is what makes the 3D stack tower build and unwind automatically.
+     * We reconcile our mirrored stack against the reported frames:
+     *   deeper   → CALL frames pushed (function entered / recursed), seeded with
+     *              that frame's current variables so the node label + face show them.
+     *   shallower→ RET frames popped; each pop consumes one captured return value,
+     *              which colors the returning node "resolved" and rides the return
+     *              bubble up its edge to the parent.
+     *   same     → a LINE step; we re-sync the TOP frame's variables (so an
+     *              assignment such as `int a = …` updates the visible face) and
+     *              highlight the current source line.
+     * This is what drives the automatic recursion TREE (call graph) + stack tower,
+     * with live variable values and real return bubbles — no @VIS annotations.
      */
-    _applyStep(line, stack) {
+    _applyStep(line, frames, returns) {
       const eng = this.engine;
       const ln = (typeof line === 'number' ? line : 0) - 1; // → 0-based
       const oneBased = (typeof line === 'number') ? line : null;
 
-      if (Array.isArray(stack)) {
-        const depth = stack.length;
-        if (depth > this._stackDepth) {
-          // One CALL per new frame (usually one, but guard for jumps).
-          for (let d = this._stackDepth; d < depth; d++) {
-            eng.sandboxCall(stack[d] || 'fn', '', ln);
-            this._traceDepth('call', d + 1, stack[d] || 'fn', oneBased);
-          }
-        } else if (depth < this._stackDepth) {
-          for (let d = this._stackDepth; d > depth; d--) {
-            eng.sandboxReturn('', ln);
-            // The popped frame is gone from `stack`; name it from the PREVIOUS
-            // step's names (index d-1), which we cached last tick.
-            const name = this._stackNames[d - 1] || 'fn';
-            this._traceDepth('return', d, name, oneBased);
-          }
-        } else {
-          eng.sandboxLine(ln, 'Execute line');
-        }
-        this._stackDepth = depth;
-        this._stackNames = stack.slice();   // cache for naming the next pop
-      } else {
-        // No stack introspection available — degrade to line highlighting only.
+      if (!Array.isArray(frames)) {
+        // No introspection available — degrade to line highlighting only.
         eng.sandboxLine(ln, 'Execute line');
+        this._stepCount++;
+        return;
       }
+
+      // Queue any return values that arrived with this step; consumed per pop.
+      if (Array.isArray(returns) && returns.length) {
+        for (const rv of returns) this._retQueue.push(rv);
+      }
+
+      const depth = frames.length;
+
+      if (depth > this._stackDepth) {
+        // Enter one CALL per new frame. Label it with a compact signature built
+        // from its current variables (the bound args at entry). That label becomes
+        // the call-graph NODE caption (e.g. "fib(3)"); parentId/depth are set by
+        // the engine so the tree lays out top-down and edges connect parent→child.
+        for (let d = this._stackDepth; d < depth; d++) {
+          const f = frames[d] || { label: 'fn', vars: [] };
+          const vars = f.vars || [];
+          const sig = this._signature(f.label, vars);
+          eng.emitCallEnter(ln, sig, [], vars.slice(), `Call ${sig}`);
+          this._traceDepth('call', d + 1, sig, oneBased);
+        }
+      } else if (depth < this._stackDepth) {
+        // Pop returned frames, consuming one captured return value per pop (FIFO,
+        // innermost-first). The engine marks the node resolved + fires the bubble.
+        for (let d = this._stackDepth; d > depth; d--) {
+          const retVal = this._retQueue.length ? this._retQueue.shift() : '';
+          eng.sandboxReturn(retVal, ln);
+          const name = this._stackNames[d - 1] || 'fn';
+          this._traceDepth('return', d, name, oneBased, retVal);
+        }
+        // After popping, refresh the now-top frame's variables (a return usually
+        // just assigned into the caller, e.g. `int a = fib(...)`).
+        this._syncTop(frames, ln);
+      } else {
+        // Same depth: re-sync the top frame's variables and highlight the line.
+        this._syncTop(frames, ln);
+      }
+
+      this._stackDepth = depth;
+      this._stackNames = frames.map((f) => f.label);
+      // Remember the top frame's variable snapshot so the next pop can reference it.
+      this._lastFrames = frames.map((f) => ({ label: f.label, vars: (f.vars || []).slice() }));
       this._stepCount++;
+    }
+
+    /**
+     * Re-sync the current top-of-stack frame's variables into the engine and
+     * highlight `line`. Uses emitLineHighlight's localsPatch so newly-appeared
+     * locals (an assignment mid-function) show up on the frame face immediately.
+     */
+    _syncTop(frames, ln) {
+      const top = frames[frames.length - 1];
+      const patch = top && top.vars ? top.vars.slice() : [];
+      this.engine.emitLineHighlight(ln, 'Execute line', patch);
+    }
+
+    /** Build a compact call signature like "fib(n=4)" from a frame's variables. */
+    _signature(label, vars) {
+      if (!vars || !vars.length) return `${label}()`;
+      const inner = vars.map((v) => `${v.name}=${v.value}`).join(', ');
+      const sig = `${label}(${inner})`;
+      return sig.length > 48 ? `${label}(…)` : sig;
     }
 
     /**
@@ -456,11 +616,13 @@
      *     depth 2  ← return dfs       @ L18
      *   depth 1  ← return main
      */
-    _traceDepth(kind, depth, name, line) {
+    _traceDepth(kind, depth, name, line, retVal) {
       const indent = '  '.repeat(Math.max(0, depth - 1));
       const arrow = kind === 'call' ? '→ enter ' : '← return ';
       const at = (typeof line === 'number') ? `  @ L${line}` : '';
-      this._term(`${indent}${arrow}${name}  ·depth ${depth}${at}`, 'dim');
+      const rv = (kind === 'return' && retVal !== undefined && retVal !== '')
+        ? `  ⇒ ${retVal}` : '';
+      this._term(`${indent}${arrow}${name}  ·depth ${depth}${at}${rv}`, 'dim');
     }
 
     _killWorker() {

@@ -1271,60 +1271,79 @@
     els.btnCppExample.addEventListener('click', () => {
       if (window.__cppEditor) window.__cppEditor.setValue(EXAMPLE_CPP);
       if (els.cppStdin) els.cppStdin.value = EXAMPLE_STDIN;
-      if (els.testCaseFormat) els.testCaseFormat.value = 'graph';
-      appendTerminal('Loaded example: recursive DFS over a graph read from stdin. Stack + lines trace automatically.', 'dim');
+      if (els.testCaseFormat) els.testCaseFormat.value = 'raw';
+      appendTerminal('Loaded example: recursive Fibonacci. The branching call tree, live args, and return values all draw automatically — no @VIS commands.', 'dim');
     });
   }
 
-  // A second, graph-flavored example the "Load Example" button can restore to.
-  // A plain, unannotated DFS. The graph is drawn automatically from stdin (format
-  // = "Graph"), and the recursion — call stack + current line — is traced by the
-  // debugger with no @VIS scaffolding. The single manual line is the HIGHLIGHT
-  // that lights up each node as DFS visits it.
-  const EXAMPLE_CPP = `// Standard recursive DFS. Reads "N M" then M edges "u v".
-// The graph, call stack, and line highlighting are all automatic.
+  // DEFAULT example: plain mathematical recursion. Nothing is annotated — the
+  // debugger reads each fib(n) activation off the call stack, spawns a call-graph
+  // node labelled with its argument, draws the parent→child edge, and animates the
+  // return value back up the edge when the frame pops. This is the recursion-tree
+  // (recursionvisualizer.com-style) view the sandbox is built for. Format = "raw"
+  // because there's no data-structure test case to auto-draw; n is read from stdin.
+  const EXAMPLE_CPP = `// Recursive Fibonacci — paste it, hit Run, watch the tree branch.
+// No @VIS annotations: the call graph, the live argument on each node, and the
+// return value bubbling back up the edge are ALL read from the debugger.
 #include <iostream>
 using namespace std;
 
-int adj[100][100];   // adjacency matrix
-int deg[100];        // neighbor count per node
-bool seen[100];
+int fib(int n) {
+    if (n < 2) return n;          // base case → leaf, returns n
+    int a = fib(n - 1);           // left child
+    int b = fib(n - 2);           // right child
+    return a + b;                 // returns up to the caller
+}
 
-void dfs(int u) {
+int main() {
+    int n;
+    cin >> n;                     // read n from the stdin box
+    int result = fib(n);
+    cout << "fib(" << n << ") = " << result << endl;
+    return 0;
+}
+`;
+
+  // Default test case for EXAMPLE_CPP: compute fib(5). Bump it to 6–7 for a
+  // bushier tree (kept small so the branching stays readable on screen).
+  const EXAMPLE_STDIN = `5
+`;
+
+  // A second, graph-flavored example: an unannotated recursive DFS. Switch the
+  // format selector to "Graph (N nodes, M edges)" and paste an "N M" + edges
+  // stdin to use it. Kept here as a reference for the graph-traversal workflow.
+  // eslint-disable-next-line no-unused-vars
+  const EXAMPLE_CPP_DFS = `// Recursive DFS. Reads "N M" then M edges "u v" from stdin (format = Graph).
+// JSCPP has no GLOBAL arrays, so adjacency lives in main() and is passed by ref.
+#include <iostream>
+using namespace std;
+
+void dfs(int u, int adj[20][20], int deg[20], bool seen[20]) {
     seen[u] = true;
-    // The ONE manual command: light up the node we're visiting.
-    cout << "@VIS:HIGHLIGHT:" << u << endl;
+    cout << "@VIS:HIGHLIGHT:" << u << endl;   // light up the visited node
     for (int i = 0; i < deg[u]; i++) {
         int v = adj[u][i];
-        if (!seen[v]) {
-            dfs(v);        // recursion → stack tower grows/unwinds on its own
-        }
+        if (!seen[v]) dfs(v, adj, deg, seen);
     }
 }
 
 int main() {
     int n, m;
     cin >> n >> m;
+    int adj[20][20];
+    int deg[20];
+    bool seen[20];
+    for (int i = 0; i < n; i++) { deg[i] = 0; seen[i] = false; }
     for (int k = 0; k < m; k++) {
         int u, v;
         cin >> u >> v;
         adj[u][deg[u]++] = v;
-        adj[v][deg[v]++] = u;   // undirected
+        adj[v][deg[v]++] = u;
     }
-    dfs(0);
+    dfs(0, adj, deg, seen);
     cout << "dfs complete" << endl;
     return 0;
 }
-`;
-
-  // Default test case for EXAMPLE_CPP: 5 nodes, 5 edges (a 3-cycle with a tail).
-  // Format selector should be "Graph (N nodes, M edges)".
-  const EXAMPLE_STDIN = `5 5
-0 1
-1 2
-2 0
-2 3
-3 4
 `;
 
   function wireLinearAlgebra() {

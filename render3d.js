@@ -1544,24 +1544,30 @@
       if (!this._recTreeGroup) this._buildRecursion();
       this._sandboxActive = true;
       this._recActive = false;      // NOT recursion mode — DS layer stays live
-      this._recMode = 'stack';      // sandbox always uses the tower overlay
+      // Sandbox shows the CALL TREE (recursionvisualizer.com-style branching
+      // graph) as the primary view on the field, PLUS the stack tower as a
+      // pinned HUD overlay. Both render every frame (see renderFrame).
+      this._recMode = 'tree';
       this._recLastStepIndex = -1;
       this._recPrevFrame = null;
       this._recLastFrame = null;
       this._recBubbleAnim = null;
       this._recStackAnim = null;
 
-      // DS layer visible; call tree hidden; stack tower shown as the overlay.
+      // A pure mathematical recursion (fib, coin change, subset sum) draws no
+      // input graph, so the call tree owns the field. Any auto-setup graph nodes
+      // stay visible too; they simply coexist. Both the tree group and the tower
+      // group are shown; the tower is camera-pinned so it never overlaps the tree.
       for (const g of this.nodeMeshes.values()) g.visible = true;
       for (const g of this.edgeMeshes.values()) g.visible = true;
       this.grid.visible = true;
-      this._recTreeGroup.visible = false;
+      this._recTreeGroup.visible = true;
       this._recStackGroup.visible = true;
 
-      // Gentle head-on framing so both the graph and the tower read well; the
-      // user can still pinch/drag to orbit the graph.
+      // Head-on framing so the branching tree reads clearly; the user can still
+      // pinch/drag to orbit. The tree auto-fits its own scale (see _renderCallTree).
       this.autoRotate = false;
-      this._camTarget.set(0, 3, 34);
+      this._camTarget.set(0, 3, 40);
     }
 
     /** Leave sandbox overlay: hide the tower, DS layer already visible. */
@@ -1609,8 +1615,17 @@
       // flourish is scheduled below from the diff + direction.
       this._recScheduleFlourish(frame, prev, dir);
 
-      if (this._recMode === 'tree') this._renderCallTree(frame);
-      else this._renderStackTower(frame);
+      // Sandbox shows BOTH: the call tree (recursionvisualizer-style call graph)
+      // on the field AND the stack tower as a camera-pinned HUD. Recursion mode
+      // shows exactly one, per _recMode.
+      if (this._sandboxActive) {
+        this._renderCallTree(frame);
+        this._renderStackTower(frame);
+      } else if (this._recMode === 'tree') {
+        this._renderCallTree(frame);
+      } else {
+        this._renderStackTower(frame);
+      }
 
       this._recPrevFrame = frame;
       this._recLastStepIndex = idx;
@@ -1819,7 +1834,10 @@
       const easeInOut = (u) => (u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2);
 
       // --- Tree: ease group scale toward the depth-aware fit ---------------
-      if (this._recMode === 'tree' && this._recTreeFitScale) {
+      // Runs whenever the tree group is on-screen — that's recursion 'tree' mode
+      // OR a sandbox run (which shows the tree on the field AND the tower HUD).
+      const treeShown = this._recTreeGroup && this._recTreeGroup.visible;
+      if (treeShown && this._recTreeFitScale) {
         const cur = this._recTreeGroup.scale.x;
         const s = cur + (this._recTreeFitScale - cur) * LERP;
         this._recTreeGroup.scale.setScalar(s);
@@ -1845,7 +1863,9 @@
       }
 
       // --- Stack: ease group scale/shift so the top stays framed ----------
-      if (this._recMode === 'stack') {
+      // Runs whenever the tower is visible: recursion 'stack' mode OR sandbox
+      // (which shows tree + tower together).
+      if (this._recMode === 'stack' || this._sandboxActive) {
         const g = this._recStackGroup;
         const targetS = this._recStackFitScale || 1;
         const s = g.scale.x + (targetS - g.scale.x) * LERP;
