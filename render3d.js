@@ -1207,14 +1207,21 @@
     }
 
     /**
-     * Build the 3D coordinate cage: three families of grid lines on the XY, XZ
-     * and YZ planes plus a Z axis, kept modest in extent so the line count stays
-     * cheap. Hidden until setLinearDimension('3d'). Morphs via _laWriteGeometry
-     * against `_la3DBasePoints` (same column-major transform as the 2D lattice).
+     * Build the VERTICAL half of the 3D coordinate space. The flat XY floor is
+     * the existing 2D lattice (`_laLiveGrid` + `_laRefGrid`), which stays visible
+     * in 3D — so here we only add the two vertical families of grid lines (the
+     * XZ and YZ planes) plus a Z axis. Result: 3D is exactly the 2D grid with a
+     * third dimension added, same square spacing, same "infinite" ±N extent,
+     * same materials (a live morphing copy + a dim static reference).
+     *
+     * The live vertical planes morph via _laWriteGeometry against
+     * `_la3DBasePoints` (same column-major transform as the floor); the static
+     * reference is filled once at identity so the deformation stays legible.
      */
     _laBuild3DGrid() {
-      // Smaller than the 2D "infinite" plane — a readable boxed cage.
-      const M = 8;
+      // Same extent + unit spacing as the flat 2D lattice, so a full zoom-out
+      // never reveals an edge and the squares match the floor exactly.
+      const M = this._laN;
       this._la3DBasePoints = [];
       const positions = [];
       const seg = (ax, ay, az, bx, by, bz) => {
@@ -1222,23 +1229,36 @@
         this._la3DBasePoints.push(new THREE.Vector3(bx, by, bz));
         positions.push(0, 0, 0, 0, 0, 0);
       };
+      // Only the two VERTICAL planes — the XY floor already exists in 2D.
       for (let i = -M; i <= M; i++) {
-        seg(i, -M, 0, i, M, 0); seg(-M, i, 0, M, i, 0); // XY plane
         seg(i, 0, -M, i, 0, M); seg(-M, 0, i, M, 0, i); // XZ plane
         seg(0, i, -M, 0, i, M); seg(0, -M, i, 0, M, i); // YZ plane
       }
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
-      const mat = new THREE.LineBasicMaterial({
-        color: 0x0f6b7a, transparent: true, opacity: 0.28,
+
+      // Live (morphing) vertical grid — material matches the 2D live floor.
+      const liveGeo = new THREE.BufferGeometry();
+      liveGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
+      this._la3DGrid = new THREE.LineSegments(liveGeo, new THREE.LineBasicMaterial({
+        color: 0x00f3ff, transparent: true, opacity: 0.55,
         blending: THREE.AdditiveBlending, depthWrite: false,
-      });
-      this._la3DGrid = new THREE.LineSegments(geo, mat);
+      }));
       this._la3DGrid.frustumCulled = false;
       this._la3DGrid.visible = false;
       this.laGroup.add(this._la3DGrid);
 
-      // Z axis line (X and Y already exist in _laBuildAxes).
+      // Static reference vertical grid (dim, never moves) — matches the 2D ref.
+      const refGeo = new THREE.BufferGeometry();
+      refGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions.slice()), 3));
+      this._la3DRefGrid = new THREE.LineSegments(refGeo, new THREE.LineBasicMaterial({
+        color: 0x1b3a44, transparent: true, opacity: 0.4, depthWrite: false,
+      }));
+      this._la3DRefGrid.frustumCulled = false;
+      this._la3DRefGrid.visible = false;
+      this.laGroup.add(this._la3DRefGrid);
+      // Reference planes are identity forever — fill once.
+      this._laWriteGeometry(this._la3DRefGrid.geometry, IDENTITY3, this._la3DBasePoints);
+
+      // Z axis line (X and Y already exist in _laBuildAxes), styled like them.
       const zGeo = new THREE.BufferGeometry();
       zGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
         0, 0, -this._laN, 0, 0, this._laN,
@@ -1252,19 +1272,20 @@
     }
 
     /**
-     * Switch between the flat 2D plane and the full 3D cage. In 3D the flat
-     * lattice is hidden in favour of the three-plane cage + Z axis, and the
-     * camera pulls back to a livelier orbit tilt so depth reads clearly.
+     * Switch between flat 2D and full 3D. 3D is a strict superset: the 2D floor
+     * (`_laLiveGrid` + `_laRefGrid`) stays visible and we simply reveal the
+     * vertical planes + Z axis on top, plus a slightly stronger orbit tilt so the
+     * added depth reads. Everything else — squares, extent, coordinate labels,
+     * mouse/hand controls — is identical to 2D.
      */
     setLinearDimension(mode) {
       const three = mode === '3d';
       this._la3D = three;
+      // Vertical planes + Z axis are the ONLY things unique to 3D. The flat
+      // floor (2D lattice) stays on in both modes.
       this._la3DGrid.visible = three;
+      this._la3DRefGrid.visible = three;
       this._laZAxis.visible = three;
-      // In 3D, dim the "infinite" flat plane so the cage doesn't fight it; the
-      // live+ref flat grids are the 2D stage, so hide them in 3D.
-      this._laLiveGrid.visible = !three;
-      this._laRefGrid.visible = !three;
       // Force a relabel (Z ticks appear/disappear) and re-apply current matrix.
       this._laLastRangeKey = '';
       if (three) {
