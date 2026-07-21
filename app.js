@@ -892,8 +892,9 @@
 
       /* ---- LINEAR-ALGEBRA MODE: grab a basis tip, else rotate the grid ---- */
       if (linearMode) {
-        const { worldPoint } = renderer.raycastScreen(e.clientX, e.clientY);
-        const pick = renderer.laBasisPick(worldPoint);
+        // Screen-space pick so all three arrows (incl. purple k̂, which points
+        // toward the camera in the tilted view) are grabbable.
+        const pick = renderer.laPickScreen(e.clientX, e.clientY);
         if (pick !== null && renderer.laGrabBasis(pick)) {
           mouse.laDrag = true;
           setMode('LA_DRAG');
@@ -923,13 +924,11 @@
 
       // Hover highlight for LA basis tips even before grabbing.
       if (linearMode && !mouse.laDrag && !mouse.navFrom) {
-        const { worldPoint } = renderer.raycastScreen(e.clientX, e.clientY);
-        renderer.laHighlightBasis(renderer.laBasisPick(worldPoint));
+        renderer.laHighlightBasis(renderer.laPickScreen(e.clientX, e.clientY));
       }
 
       if (mouse.laDrag) {
-        const { worldPoint } = renderer.raycastScreen(e.clientX, e.clientY);
-        syncMatrixFromRenderer(renderer.laDragBasisTo(worldPoint));
+        syncMatrixFromRenderer(renderer.laDragScreen(e.clientX, e.clientY));
         return;
       }
 

@@ -923,9 +923,15 @@
       this.laGroup.visible = false;
       this.field.add(this.laGroup);
 
-      // Grid extent: lines span [-N, N] on each axis, one line per unit.
-      this._laN = 6;
+      // Grid extent: lines span [-N, N] on each axis, one line per unit. N is
+      // deliberately large (effectively "infinite" for this stage) so that even
+      // a big transform (Scale 5×, etc.) keeps the live grid filling the view
+      // and never shrinks past the static reference frame.
+      this._laN = 50;
       const N = this._laN;
+      // How many integer ticks to label on each axis (±LABEL_N). Kept small so
+      // the numbers stay legible even though the lattice itself runs to ±N.
+      this._laLabelN = 10;
 
       // The base (undeformed) lattice points, stored as flat Vector3 list per
       // line so applyMatrix can recompute deformed positions each frame without
@@ -996,12 +1002,80 @@
       this._laActive = false;
       this._laGrabbed = null;        // index of basis vector being dragged, or null
       this._laHi = null;             // index of currently highlighted basis arrow
-      // Only î (0) and ĵ (1) are grabbable — k̂ points out of the z=0 drag
-      // plane, so an in-plane cursor can't meaningfully reposition it.
-      this.LA_GRAB_RADIUS = 0.9;     // field-local pick radius around a basis tip
+      // All three basis tips (î, ĵ, k̂) are grabbable. Picking is done in screen
+      // space (see laPickScreen) so k̂ — which points toward the camera in the
+      // tilted view — can be grabbed just like the in-plane vectors.
+      this.LA_GRAB_RADIUS = 0.9;     // field-local pick radius (legacy hand path)
+      this.LA_PICK_PX = 26;          // screen-space pick radius in pixels (mouse)
+
+      // Bright X/Y axes + integer number labels on the STATIC reference frame,
+      // so the moving grid can be read against a fixed Cartesian coordinate system.
+      this._laBuildAxes();
 
       // Seed geometry + arrows at identity.
       this._laApplyDisplayed(IDENTITY3.slice());
+    }
+
+    /**
+     * Build the static Cartesian reference: two bright axis lines (X, Y) through
+     * the origin plus integer tick-number sprites from -LABEL_N..LABEL_N on each
+     * axis. These live on the FIXED reference frame (they never deform) so the
+     * user reads the morphing live grid against a stable coordinate system — the
+     * standard 3B1B convention. All parented to laGroup so they toggle + orbit
+     * with everything else.
+     */
+    _laBuildAxes() {
+      const N = this._laN;
+      const L = this._laLabelN;
+
+      // --- Axis lines (slightly brighter than the reference lattice) --------
+      const axisGeo = new THREE.BufferGeometry();
+      axisGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
+        -N, 0, 0, N, 0, 0,   // X axis
+        0, -N, 0, 0, N, 0,   // Y axis
+      ]), 3));
+      const axisMat = new THREE.LineBasicMaterial({
+        color: 0x4a6b78, transparent: true, opacity: 0.85, depthWrite: false,
+      });
+      this._laAxes = new THREE.LineSegments(axisGeo, axisMat);
+      this._laAxes.frustumCulled = false;
+      this.laGroup.add(this._laAxes);
+
+      // --- Integer tick labels along each axis ------------------------------
+      // Sprites are cheap and camera-facing; skip 0 on the axes (one origin "0").
+      this._laLabels = [];
+      const addLabel = (text, x, y) => {
+        const s = this._laMakeLabel(text);
+        s.position.set(x, y, 0);
+        this.laGroup.add(s);
+        this._laLabels.push(s);
+      };
+      for (let i = -L; i <= L; i++) {
+        if (i === 0) continue;
+        addLabel(String(i), i, -0.42);   // X axis ticks (just below the axis)
+        addLabel(String(i), -0.42, i);   // Y axis ticks (just left of the axis)
+      }
+      addLabel('0', -0.42, -0.42);       // single origin marker
+    }
+
+    /** A small camera-facing number sprite for axis ticks (canvas texture). */
+    _laMakeLabel(text) {
+      const cvs = document.createElement('canvas');
+      cvs.width = 64; cvs.height = 64;
+      const ctx = cvs.getContext('2d');
+      ctx.clearRect(0, 0, 64, 64);
+      ctx.fillStyle = '#8fb3c2';
+      ctx.font = 'bold 34px "SFMono-Regular", Consolas, monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text, 32, 34);
+      const tex = new THREE.CanvasTexture(cvs);
+      tex.minFilter = THREE.LinearFilter;
+      const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: tex, transparent: true, depthWrite: false, depthTest: false,
+      }));
+      sprite.scale.set(0.7, 0.7, 1);
+      return sprite;
     }
 
     /** Build one basis-vector arrow (unit length along +X; oriented later). */
@@ -1079,11 +1153,13 @@
       for (const g of this.edgeMeshes.values()) g.visible = false;
       this.grid.visible = false;
       this._linkLine.visible = false;
-      // Face the grid: park the camera on +Z looking at origin, stop orbiting.
+      // Tilt to a gentle 3/4 view (not dead head-on) so the purple k̂ vector
+      // visibly sticks out of the z=0 plane and can be grabbed; the XY grid +
+      // numbers stay readable in perspective. User can still pinch/drag to orbit.
       this.autoRotate = false;
       this._camTarget.set(0, 2, 24);
-      this.field.rotation.set(0, 0, 0);
-      this._rotTarget.set(0, 0, 0, 'YXZ');
+      this.field.rotation.set(-0.35, 0.45, 0, 'YXZ');
+      this._rotTarget.set(-0.35, 0.45, 0, 'YXZ');
       this.resetMatrix(true);
     }
 
@@ -1162,6 +1238,92 @@
         if (d2 <= bestD2) { bestD2 = d2; best = i; }
       }
       return best;
+    }
+
+    /**
+     * Screen-space pick: project all THREE basis tips (î, ĵ, k̂) to pixels and
+     * return the index of the nearest within LA_PICK_PX, or null. Unlike
+     * laBasisPick (which measures distance on the flat z=0 plane and so can't
+     * see k̂ once it points toward the camera), this works for every arrow in
+     * the tilted 3D view because it compares actual on-screen positions.
+     */
+    laPickScreen(clientX, clientY) {
+      if (!this._laActive) return null;
+      const rect = this.canvas.getBoundingClientRect();
+      if (!rect.width || !rect.height) return null;
+      const px = clientX - rect.left;
+      const py = clientY - rect.top;
+      const m = this._laDisplayed;
+      const PICK = this.LA_PICK_PX || 26;
+      let best = null;
+      let bestD2 = PICK * PICK;
+      for (let i = 0; i < 3; i++) {
+        // Basis tip is field-local at column i of the displayed matrix.
+        const tip = this._tmpVec3.set(m[i * 3], m[i * 3 + 1], m[i * 3 + 2]);
+        const world = this.field.localToWorld(tip.clone());
+        world.project(this.camera);                 // → NDC
+        // Behind the camera → skip.
+        if (world.z > 1) continue;
+        const sx = (world.x * 0.5 + 0.5) * rect.width;
+        const sy = (-world.y * 0.5 + 0.5) * rect.height;
+        const dx = sx - px, dy = sy - py;
+        const d2 = dx * dx + dy * dy;
+        if (d2 <= bestD2) { bestD2 = d2; best = i; }
+      }
+      return best;
+    }
+
+    /**
+     * Screen-space drag of the grabbed basis tip. Casts the cursor ray into the
+     * scene and intersects the correct plane for the grabbed axis, then rewrites
+     * that matrix column (field-local) and refreshes the grid. Returns the new
+     * column-major matrix (for the UI to mirror), or null.
+     *
+     *   î / ĵ  → constrained to the grid's own plane (the field-local z=0 plane,
+     *            expressed in world space so it stays correct when the view is
+     *            tilted or orbited). Keeps the two in-plane vectors in-plane.
+     *   k̂      → a camera-facing plane through the origin, giving full 3D reach
+     *            so the purple arrow can be pulled out of / into the plane.
+     */
+    laDragScreen(clientX, clientY) {
+      const i = this._laGrabbed;
+      if (i === null || i === undefined) return null;
+      const rect = this.canvas.getBoundingClientRect();
+      if (!rect.width || !rect.height) return null;
+
+      this.pointerNDC.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+      this.pointerNDC.y = -(((clientY - rect.top) / rect.height) * 2 - 1);
+      this.raycaster.setFromCamera(this.pointerNDC, this.camera);
+
+      // Field origin in world space, and the field's local +Z axis in world.
+      const originW = this.field.localToWorld(this._tmpVec3.set(0, 0, 0).clone());
+      let normalW;
+      if (i === 2) {
+        // k̂: face the camera so depth is reachable.
+        normalW = this.camera.getWorldDirection(new THREE.Vector3()).negate();
+      } else {
+        // î/ĵ: the grid plane. Field-local +Z transformed to world (rotation
+        // only), so a tilted/orbited field still constrains the drag correctly.
+        normalW = new THREE.Vector3(0, 0, 1)
+          .applyQuaternion(this.field.getWorldQuaternion(new THREE.Quaternion()))
+          .normalize();
+      }
+      const plane = this._laDragPlane || (this._laDragPlane = new THREE.Plane());
+      plane.setFromNormalAndCoplanarPoint(normalW, originW);
+
+      const hitW = this._laDragHit || (this._laDragHit = new THREE.Vector3());
+      if (!this.raycaster.ray.intersectPlane(plane, hitW)) return null;
+
+      // World hit → field-local, which is the space the matrix columns live in.
+      const local = this.field.worldToLocal(hitW.clone());
+      const m = this._laDisplayed;
+      m[i * 3] = local.x;
+      m[i * 3 + 1] = local.y;
+      m[i * 3 + 2] = (i === 2) ? local.z : 0;   // î/ĵ pinned to the plane
+      this._laFrom = m.slice();
+      this._laTo = m.slice();
+      this._laApplyDisplayed(m);
+      return m.slice();
     }
 
     /** Highlight (or clear) the basis arrow the cursor is hovering/holding. */
