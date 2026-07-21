@@ -277,12 +277,14 @@
   </script>
 
   <!-- App modules. Order matters: engines first, orchestrator last. -->
-  <script src="dsaEngine.js"></script>
-  <script src="render3d.js"></script>
-  <script src="vision.js"></script>
-  <script src="speech.js"></script>
-  <script src="sandbox.js"></script>
-  <script src="app.js"></script>
+  <!-- ?v= cache-buster: bump when editing local scripts so the browser can't
+       serve a stale copy (no build step = aggressive default caching). -->
+  <script src="dsaEngine.js?v=2"></script>
+  <script src="render3d.js?v=2"></script>
+  <script src="vision.js?v=2"></script>
+  <script src="speech.js?v=2"></script>
+  <script src="sandbox.js?v=2"></script>
+  <script src="app.js?v=2"></script>
 
   <!-- CodeMirror bootstrap (module). Builds the editor and exposes a tiny shim
        on window.__cppEditor: { getValue(), setValue(str) }. If the CDN import
