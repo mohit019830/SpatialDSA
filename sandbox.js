@@ -123,7 +123,13 @@
       // holds the ARGUMENTS, and the block scopes that follow it (CompoundStatement,
       // SelectionStatement_if, IterationStatement_for, …) hold that frame's LOCALS —
       // until the next "function <name>" opens the child frame. We fold all those
-      // into the current frame. Returns [{label, vars:[{name,value}]}] bottom→top.
+      // into the current frame. ARGS vs LOCALS: the "function <name>" scope cell
+      // itself holds the bound arguments; the block scopes that follow hold the
+      // locals. We keep them separate because ARGS are stable for a frame's whole
+      // lifetime (fib's n never changes) — the main thread uses label+args as the
+      // frame's IDENTITY for common-prefix stack reconciliation, which is what
+      // makes sibling recursive calls (fib(n-1) then fib(n-2)) resolve correctly.
+      // Returns [{label, args:[{name,value}], locals:[{name,value}]}] bottom→top.
       function readFrames(dbg) {
         try {
           var rt = dbg && dbg.rt;
@@ -131,25 +137,31 @@
           if (!Array.isArray(scope)) return null;
           var frames = [];
           var cur = null;
+          var curIsFuncCell = false;   // are we still on the function's own cell?
           for (var i = 0; i < scope.length; i++) {
             var sc = scope[i];
             var nm = sc && sc['$name'];
             if (typeof nm === 'string' && nm.indexOf('function ') === 0) {
-              cur = { label: nm.slice(9), vars: [] };
+              cur = { label: nm.slice(9), args: [], locals: [] };
               frames.push(cur);
+              curIsFuncCell = true;    // this cell's vars are the arguments
+            } else {
+              curIsFuncCell = false;   // subsequent block cells hold locals
             }
             if (!cur) continue; // skip the global scope's builtins (cin/cout/funcs)
+            var bucket = curIsFuncCell ? cur.args : cur.locals;
             for (var key in sc) {
               if (key === '$name') continue;
               var val = sc[key];
               if (val && typeof val === 'object' && ('t' in val) && ('v' in val)) {
                 var vs = valStr(rt, val);
                 if (vs === null) continue;
+                // De-dup across BOTH buckets (a name already shown as an arg
+                // shouldn't reappear as a local).
                 var dup = false;
-                for (var d = 0; d < cur.vars.length; d++) {
-                  if (cur.vars[d].name === key) { dup = true; break; }
-                }
-                if (!dup) cur.vars.push({ name: key, value: vs });
+                for (var a = 0; a < cur.args.length; a++) if (cur.args[a].name === key) { dup = true; break; }
+                for (var b = 0; !dup && b < cur.locals.length; b++) if (cur.locals[b].name === key) { dup = true; break; }
+                if (!dup) bucket.push({ name: key, value: vs });
               }
             }
           }
@@ -210,45 +222,89 @@
 
         // RETURN-VALUE CAPTURE. The debugger's public stepping (next/nextNode)
         // swallows the value a function returns — dbg.next() just yields false
-        // until the whole program ends. The ONE reliable interception point
-        // (verified against 2.0.2) is the return-statement visitor itself, which
-        // evaluates to ["return", {t,v}] the instant the value is computed. We wrap
-        // it and push each value onto a FIFO. Returns fire innermost-first — the
-        // same order frames pop — so the main thread consumes the queue one value
-        // per detected pop and the two stay aligned. Guarded: if the visitor table
-        // isn't shaped as expected, we simply capture nothing (bubbles show blank).
+        // until the whole program ends, so we have to intercept internally.
+        //
+        // CRITICAL: we must NOT replace any interpreter visitor. The CDN es5 build
+        // transpiles every visitor generator through traceur and drives them with
+        // a custom coroutine trampoline that only recognizes ITS OWN tagged
+        // functions (it even overrides Function.prototype.call/apply). Swapping in
+        // a fresh JS function — native generator OR a plain passthrough — makes
+        // the trampoline treat it as an ordinary call, never run its body as a
+        // coroutine, and drop the ["return",{t,v}] tuple. defFunc then sees no
+        // return value for a non-void function and throws "you must return a
+        // value". (This is invisible under Node's native-generator lib build,
+        // which is why it slipped through earlier — it only bites the real bundle.)
+        //
+        // The safe seam is a pair of PLAIN runtime methods (not coroutines), each
+        // firing exactly on a function return:
+        //   rt.cast(retType, value) runs on the value at the return site, and
+        //   rt.exitScope("function <name>") fires once as that frame unwinds.
+        // We remember the last value cast at the returning frame's depth and commit
+        // it to the FIFO when its scope exits. Returns land innermost-first — the
+        // same order frames pop — so the main thread pairs them with detected pops.
+        // Guarded: if the runtime shape differs, we capture nothing (blank bubbles).
         var retQueue = [];      // captured return values, oldest first
         try {
-          var interp = dbg.rt && dbg.rt.interp;
-          var vis = interp && interp.visitors;
-          if (vis && typeof vis.JumpStatement_return === 'function') {
-            var origRet = vis.JumpStatement_return;
-            vis.JumpStatement_return = function* (i2, s2, p2) {
-              var r = yield* origRet.call(this, i2, s2, p2);
+          var rt = dbg.rt;
+          if (rt && typeof rt.cast === 'function' && typeof rt.exitScope === 'function') {
+            var lastCast = null;   // { v, depth } of the most recent cast value
+            var origCast = rt.cast;
+            rt.cast = function (type, value) {
+              var res = origCast.call(this, type, value);
               try {
-                if (r && r.length && r[0] === 'return' && r[1] && ('t' in r[1])) {
-                  var vs = valStr(dbg.rt, r[1]);
-                  retQueue.push(vs === null ? '' : vs);
-                } else if (r && r[0] === 'return') {
-                  retQueue.push('');   // void return — still a pop
-                }
+                var vs = valStr(rt, res);
+                lastCast = { v: (vs === null ? '' : vs), depth: rt.scope.length };
               } catch (e) {}
-              return r;
+              return res;
+            };
+            // A function is void iff its global function-pointer var carries a
+            // void retType. Functions are registered DURING JSCPP.run (before it
+            // hands back the debugger), so we read the already-stored type here
+            // rather than trying to wrap regFunc after the fact. Without this, a
+            // void function (e.g. a dfs) would mis-report the last value cast in
+            // its body (a cout<< operand, say) as a bogus return value.
+            var isVoidFn = function (name) {
+              try {
+                var g = rt.scope[0][name];
+                var ret = g && g.t && g.t.retType;
+                return !!(ret && rt.isTypeEqualTo(ret, rt.voidTypeLiteral));
+              } catch (e) { return false; }
+            };
+            var origExit = rt.exitScope;
+            rt.exitScope = function (name) {
+              if (typeof name === 'string' && name.indexOf('function ') === 0) {
+                // A value cast at this frame's depth is this function's return
+                // value; a void function (or no cast) yields a blank bubble. The
+                // pop still gets an entry either way so the queue stays aligned
+                // one-per-pop with the reconciler on the main thread.
+                if (!isVoidFn(name.slice(9)) && lastCast && lastCast.depth === rt.scope.length) {
+                  retQueue.push(lastCast.v);
+                  lastCast = null;
+                } else {
+                  retQueue.push('');
+                }
+              }
+              return origExit.call(this, name);
             };
           }
         } catch (e) { /* no capture; bubbles will be blank but tree still builds */ }
 
-        // Signature of a frame list, used to coalesce steps: emit a new snapshot
-        // only when the line, the call depth, OR any visible variable changed —
-        // so assignments like "int a = …" produce a step even on the same line.
+        // Signature of a frame list, used to coalesce steps. It includes each
+        // frame's label, ARGS, and LOCALS, so a snapshot is emitted whenever the
+        // call stack changes shape (push/pop), OR a sibling frame swaps in at the
+        // same depth (fib(n-1) → fib(n-2)), OR a visible variable changes. Keying
+        // on full identity — not just line/depth — is what stops a return and the
+        // next sibling's call from coalescing into one step and losing both.
         function framesSig(frames) {
           if (!frames) return '?';
           var parts = [];
           for (var i = 0; i < frames.length; i++) {
             var f = frames[i];
-            var vs = [];
-            for (var j = 0; j < f.vars.length; j++) vs.push(f.vars[j].name + '=' + f.vars[j].value);
-            parts.push(f.label + '(' + vs.join(',') + ')');
+            var av = [];
+            for (var a = 0; a < f.args.length; a++) av.push(f.args[a].name + '=' + f.args[a].value);
+            var lv = [];
+            for (var j = 0; j < f.locals.length; j++) lv.push(f.locals[j].name + '=' + f.locals[j].value);
+            parts.push(f.label + '(' + av.join(',') + '){' + lv.join(',') + '}');
           }
           return parts.join('>');
         }
@@ -260,15 +316,20 @@
           var line = (node && typeof node.sLine === 'number') ? node.sLine : null;
           var frames = readFrames(dbg);
 
-          if (line !== null && line > 0) {
-            var sig = line + '|' + framesSig(frames);
-            if (sig !== lastSig) {
+          // Emit whenever the stack signature changes (push/pop/sibling-swap/var
+          // update) even if the line is momentarily the same — otherwise a return
+          // immediately followed by a sibling call on the SAME line would coalesce
+          // into one step and the reconciler would never see the pop.
+          var sig = (line || 0) + '|' + framesSig(frames);
+          if (sig !== lastSig) {
+            var hasLine = (line !== null && line > 0);
+            if (hasLine || frames) {
               // Hand over any return values captured since the last emitted step,
               // in fire order (innermost-first = pop order). The main thread pairs
-              // them with the pops it detects from the depth drop.
+              // them with the pops it detects by reconciling the frame stacks.
               var returns = retQueue;
               retQueue = [];
-              self.postMessage({ type: 'step', line: line, frames: frames, returns: returns });
+              self.postMessage({ type: 'step', line: (line || 0), frames: frames, returns: returns });
               lastSig = sig;
               if (++emitted >= ${maxEmit}) {
                 self.postMessage({ type: 'note', message: 'Step limit (' + ${maxEmit} + ') reached — trace truncated.' });
@@ -515,23 +576,16 @@
 
     /**
      * Apply one automatic debugger step. `line` is 1-based (engine wants 0-based);
-     * `frames` is the live C++ call stack bottom→top, each {label, vars:[{name,
-     * value}]}, or null if runtime introspection failed (→ line-only, no tower).
-     * `returns` is the FIFO of return values captured by the worker since the last
-     * step, in fire order (innermost-first = pop order), so we consume one per
-     * detected pop and the value lands on the frame that actually returned.
+     * `frames` is the authoritative live C++ call stack bottom→top, each
+     * {label, args:[{name,value}], locals:[{name,value}]}, or null if runtime
+     * introspection failed (→ line-only, no tree/tower). `returns` is the FIFO of
+     * return values captured by the worker since the last step, innermost-first.
      *
-     * We reconcile our mirrored stack against the reported frames:
-     *   deeper   → CALL frames pushed (function entered / recursed), seeded with
-     *              that frame's current variables so the node label + face show them.
-     *   shallower→ RET frames popped; each pop consumes one captured return value,
-     *              which colors the returning node "resolved" and rides the return
-     *              bubble up its edge to the parent.
-     *   same     → a LINE step; we re-sync the TOP frame's variables (so an
-     *              assignment such as `int a = …` updates the visible face) and
-     *              highlight the current source line.
-     * This is what drives the automatic recursion TREE (call graph) + stack tower,
-     * with live variable values and real return bubbles — no @VIS annotations.
+     * Reconciliation is by COMMON-PREFIX frame matching against the last mirrored
+     * stack (see the body) — NOT a net-depth diff. This is what makes the standard
+     * idiom `return fib(n-1) + fib(n-2);` visualize correctly: the pop of fib(n-1)
+     * and the push of fib(n-2) are detected as distinct events even though the net
+     * call depth is unchanged between the two snapshots.
      */
     _applyStep(line, frames, returns) {
       const eng = this.engine;
@@ -550,41 +604,66 @@
         for (const rv of returns) this._retQueue.push(rv);
       }
 
-      const depth = frames.length;
+      // ---- Stack reconciliation by COMMON-PREFIX frame matching -----------
+      // The old code diffed by net depth, which broke on the standard idiom
+      // `return fib(n-1) + fib(n-2);`: fib(n-1) pops and fib(n-2) pushes between
+      // two snapshots, so the depth is unchanged and BOTH the return and the new
+      // activation were silently dropped (→ nodes that never resolved).
+      //
+      // Instead we treat `_lastFrames` (what we've mirrored into the engine) and
+      // `frames` (the authoritative new stack) as two stacks and find how deep
+      // they still agree. A frame matches iff its identity key — label + bound
+      // ARGS — is equal (locals mutate mid-call, so they can't be part of identity;
+      // args are fixed for an activation's lifetime and distinguish siblings like
+      // fib(n=3) vs fib(n=2)). Everything above the common prefix in the old stack
+      // has returned (pop, newest-first); everything above it in the new stack has
+      // been entered (push, oldest-first). A same-depth sibling swap therefore
+      // shows up correctly as one pop + one push, not a no-op.
+      const prev = this._lastFrames || [];
+      const keyOf = (f) => f.label + '(' +
+        (f.args || []).map((a) => a.name + '=' + a.value).join(',') + ')';
 
-      if (depth > this._stackDepth) {
-        // Enter one CALL per new frame. Label it with a compact signature built
-        // from its current variables (the bound args at entry). That label becomes
-        // the call-graph NODE caption (e.g. "fib(3)"); parentId/depth are set by
-        // the engine so the tree lays out top-down and edges connect parent→child.
-        for (let d = this._stackDepth; d < depth; d++) {
-          const f = frames[d] || { label: 'fn', vars: [] };
-          const vars = f.vars || [];
-          const sig = this._signature(f.label, vars);
-          eng.emitCallEnter(ln, sig, [], vars.slice(), `Call ${sig}`);
-          this._traceDepth('call', d + 1, sig, oneBased);
-        }
-      } else if (depth < this._stackDepth) {
-        // Pop returned frames, consuming one captured return value per pop (FIFO,
-        // innermost-first). The engine marks the node resolved + fires the bubble.
-        for (let d = this._stackDepth; d > depth; d--) {
-          const retVal = this._retQueue.length ? this._retQueue.shift() : '';
-          eng.sandboxReturn(retVal, ln);
-          const name = this._stackNames[d - 1] || 'fn';
-          this._traceDepth('return', d, name, oneBased, retVal);
-        }
-        // After popping, refresh the now-top frame's variables (a return usually
-        // just assigned into the caller, e.g. `int a = fib(...)`).
-        this._syncTop(frames, ln);
-      } else {
-        // Same depth: re-sync the top frame's variables and highlight the line.
+      let common = 0;
+      const maxCommon = Math.min(prev.length, frames.length);
+      while (common < maxCommon && keyOf(prev[common]) === keyOf(frames[common])) {
+        common++;
+      }
+
+      // Pop everything above the common prefix in the OLD stack, deepest first,
+      // consuming one captured return value per pop so it lands on the frame that
+      // actually returned (FIFO = innermost-first = this exact order).
+      for (let d = prev.length - 1; d >= common; d--) {
+        const retVal = this._retQueue.length ? this._retQueue.shift() : '';
+        eng.sandboxReturn(retVal, ln);
+        this._traceDepth('return', d + 1, prev[d].label, oneBased, retVal);
+      }
+
+      // Push everything above the common prefix in the NEW stack, shallowest first.
+      for (let d = common; d < frames.length; d++) {
+        const f = frames[d] || { label: 'fn', args: [], locals: [] };
+        const sig = this._signature(f.label, f.args);
+        // args identify the activation (shown in the node caption); the evolving
+        // locals ride in the frame face and update on subsequent same-frame steps.
+        const locals = (f.args || []).concat(f.locals || []);
+        eng.emitCallEnter(ln, sig, [], locals, `Call ${sig}`);
+        this._traceDepth('call', d + 1, sig, oneBased);
+      }
+
+      // If nothing pushed or popped, this is an in-frame line step: refresh the
+      // top frame's variables (so an assignment like `int a = …` updates the face)
+      // and highlight the current line.
+      if (common === prev.length && common === frames.length) {
         this._syncTop(frames, ln);
       }
 
-      this._stackDepth = depth;
+      this._stackDepth = frames.length;
       this._stackNames = frames.map((f) => f.label);
-      // Remember the top frame's variable snapshot so the next pop can reference it.
-      this._lastFrames = frames.map((f) => ({ label: f.label, vars: (f.vars || []).slice() }));
+      // Mirror the authoritative stack (label + args + locals) for the next diff.
+      this._lastFrames = frames.map((f) => ({
+        label: f.label,
+        args: (f.args || []).slice(),
+        locals: (f.locals || []).slice(),
+      }));
       this._stepCount++;
     }
 
@@ -595,7 +674,8 @@
      */
     _syncTop(frames, ln) {
       const top = frames[frames.length - 1];
-      const patch = top && top.vars ? top.vars.slice() : [];
+      // Frames carry args + locals separately; both belong on the frame face.
+      const patch = top ? (top.args || []).concat(top.locals || []) : [];
       this.engine.emitLineHighlight(ln, 'Execute line', patch);
     }
 
