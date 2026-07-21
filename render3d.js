@@ -925,13 +925,15 @@
 
       // Grid extent: lines span [-N, N] on each axis, one line per unit. N is
       // deliberately large (effectively "infinite" for this stage) so that even
-      // a big transform (Scale 5×, etc.) keeps the live grid filling the view
-      // and never shrinks past the static reference frame.
-      this._laN = 50;
+      // a big transform (Scale 5×, etc.) or a far zoom-out never reveals the
+      // grid's edge — the lattice always fills the viewport.
+      this._laN = 200;
       const N = this._laN;
-      // How many integer ticks to label on each axis (±LABEL_N). Kept small so
-      // the numbers stay legible even though the lattice itself runs to ±N.
-      this._laLabelN = 10;
+      // Max labels we ever draw per axis direction (pool sizing). The ACTUAL
+      // labels shown are chosen per-frame from the zoom level (see _laNiceStep /
+      // the relabel pass in _updateLinearAlgebra), so numbers thin out when you
+      // zoom out and fill in when you zoom in — always ~8-12 ticks on screen.
+      this._laLabelMax = 40;
 
       // The base (undeformed) lattice points, stored as flat Vector3 list per
       // line so applyMatrix can recompute deformed positions each frame without
@@ -1008,6 +1010,16 @@
       this.LA_GRAB_RADIUS = 0.9;     // field-local pick radius (legacy hand path)
       this.LA_PICK_PX = 26;          // screen-space pick radius in pixels (mouse)
 
+      // 3D mode (Part B). `_la3D` toggles between the flat XY plane (default) and
+      // a full 3D coordinate cage. User-inserted vectors live in `_laVectors`;
+      // each is transformed by the SAME live matrix every frame (displayed = M·v)
+      // so applying a matrix animates the vectors alongside the lattice.
+      this._la3D = false;
+      this._laVectors = [];          // Array<{ id, v:Vector3, arrow:ArrowHelper }>
+      this._laVecNextId = 1;
+      // A modest three-plane 3D lattice (XY/XZ/YZ) + Z axis, hidden until 3D mode.
+      this._laBuild3DGrid();
+
       // Bright X/Y axes + integer number labels on the STATIC reference frame,
       // so the moving grid can be read against a fixed Cartesian coordinate system.
       this._laBuildAxes();
@@ -1018,17 +1030,16 @@
 
     /**
      * Build the static Cartesian reference: two bright axis lines (X, Y) through
-     * the origin plus integer tick-number sprites from -LABEL_N..LABEL_N on each
-     * axis. These live on the FIXED reference frame (they never deform) so the
-     * user reads the morphing live grid against a stable coordinate system — the
-     * standard 3B1B convention. All parented to laGroup so they toggle + orbit
-     * with everything else.
+     * the origin, plus a POOL of reusable number sprites. The pool is positioned
+     * + relabeled every frame from the zoom level (see _updateLinearAlgebra), so
+     * which coordinates show adapts to the visible viewport — the 3B1B "nice
+     * step" behaviour. All parented to laGroup so they toggle + orbit together.
      */
     _laBuildAxes() {
       const N = this._laN;
-      const L = this._laLabelN;
 
       // --- Axis lines (slightly brighter than the reference lattice) --------
+      // X and Y always; Z is prebuilt but only shown in 3D mode (Part B).
       const axisGeo = new THREE.BufferGeometry();
       axisGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
         -N, 0, 0, N, 0, 0,   // X axis
@@ -1041,41 +1052,76 @@
       this._laAxes.frustumCulled = false;
       this.laGroup.add(this._laAxes);
 
-      // --- Integer tick labels along each axis ------------------------------
-      // Sprites are cheap and camera-facing; skip 0 on the axes (one origin "0").
-      this._laLabels = [];
-      const addLabel = (text, x, y) => {
-        const s = this._laMakeLabel(text);
-        s.position.set(x, y, 0);
+      // --- Reusable label pool ----------------------------------------------
+      // Enough sprites for ~maxLabels ticks per axis (X + Y, both signs) plus a
+      // margin. Each carries its own canvas texture so _laSetLabel can rewrite
+      // the digits in place (no per-frame allocation).
+      this._laLabelPool = [];
+      const poolSize = this._laLabelMax * 4 + 4;
+      for (let i = 0; i < poolSize; i++) {
+        const s = this._laMakeLabel('');
+        s.visible = false;
         this.laGroup.add(s);
-        this._laLabels.push(s);
-      };
-      for (let i = -L; i <= L; i++) {
-        if (i === 0) continue;
-        addLabel(String(i), i, -0.42);   // X axis ticks (just below the axis)
-        addLabel(String(i), -0.42, i);   // Y axis ticks (just left of the axis)
+        this._laLabelPool.push(s);
       }
-      addLabel('0', -0.42, -0.42);       // single origin marker
+      // Relabel bookkeeping so we only redraw canvases when the tick set changes.
+      this._laLastStep = -1;
+      this._laLastRangeKey = '';
     }
 
-    /** A small camera-facing number sprite for axis ticks (canvas texture). */
+    /**
+     * A number sprite backed by its OWN canvas + texture so the digits can be
+     * rewritten in place via _laSetLabel. Camera-facing; sized in world units.
+     */
     _laMakeLabel(text) {
       const cvs = document.createElement('canvas');
       cvs.width = 64; cvs.height = 64;
+      const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: new THREE.CanvasTexture(cvs), transparent: true,
+        depthWrite: false, depthTest: false,
+      }));
+      sprite.userData.canvas = cvs;
+      sprite.userData.text = null;
+      sprite.scale.set(0.7, 0.7, 1);
+      if (text) this._laSetLabel(sprite, text);
+      return sprite;
+    }
+
+    /** Rewrite a pooled label sprite's text in place (skips redundant redraws). */
+    _laSetLabel(sprite, text) {
+      if (sprite.userData.text === text) return;
+      sprite.userData.text = text;
+      const cvs = sprite.userData.canvas;
       const ctx = cvs.getContext('2d');
       ctx.clearRect(0, 0, 64, 64);
       ctx.fillStyle = '#8fb3c2';
-      ctx.font = 'bold 34px "SFMono-Regular", Consolas, monospace';
+      ctx.font = 'bold 30px "SFMono-Regular", Consolas, monospace';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText(text, 32, 34);
-      const tex = new THREE.CanvasTexture(cvs);
-      tex.minFilter = THREE.LinearFilter;
-      const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
-        map: tex, transparent: true, depthWrite: false, depthTest: false,
-      }));
-      sprite.scale.set(0.7, 0.7, 1);
-      return sprite;
+      sprite.material.map.needsUpdate = true;
+    }
+
+    /**
+     * Choose a "nice" tick step (1,2,5,10,20,50,100…) from the current zoom so
+     * that ~TARGET ticks fall across the visible half-width. camZ is the camera
+     * dolly distance (larger = zoomed out). Returns an integer step ≥ 1.
+     */
+    _laNiceStep(camZ) {
+      // Visible half-extent in world units ≈ camZ * tan(fov/2) * aspect, plus a
+      // little slack. We only need it proportional to camZ for step selection.
+      const halfWidth = Math.max(2, camZ) * 0.62;   // empirical: fills the panel
+      const TARGET = 9;                              // aim for ~9 ticks per side
+      const raw = (halfWidth * 2) / TARGET;          // ideal spacing in units
+      // Snap raw up to the nearest 1·10^k / 2·10^k / 5·10^k.
+      const pow = Math.pow(10, Math.floor(Math.log10(Math.max(raw, 1e-6))));
+      const frac = raw / pow;
+      let nice;
+      if (frac <= 1) nice = 1;
+      else if (frac <= 2) nice = 2;
+      else if (frac <= 5) nice = 5;
+      else nice = 10;
+      return Math.max(1, Math.round(nice * pow));
     }
 
     /** Build one basis-vector arrow (unit length along +X; oriented later). */
@@ -1096,10 +1142,10 @@
      * Write deformed lattice positions into a LineSegments geometry given a
      * column-major 3x3 matrix `m` (9 floats). Each base point p maps to M·p.
      */
-    _laWriteGeometry(geometry, m) {
+    _laWriteGeometry(geometry, m, pts) {
       const attr = geometry.getAttribute('position');
       const arr = attr.array;
-      const pts = this._laBasePoints;
+      pts = pts || this._laBasePoints;
       for (let i = 0; i < pts.length; i++) {
         const p = pts[i];
         // Column-major: col0=(m0,m1,m2), col1=(m3,m4,m5), col2=(m6,m7,m8).
@@ -1138,6 +1184,137 @@
       this._laDisplayed = m;
       this._laWriteGeometry(this._laLiveGrid.geometry, m);
       this._laUpdateBasis(m);
+      // 3D lattice morphs with the same matrix when present + visible.
+      if (this._la3DGrid && this._la3DGrid.visible) {
+        this._laWriteGeometry(this._la3DGrid.geometry, m, this._la3DBasePoints);
+      }
+      // Re-point every user vector to M·v (column-major mapping, same as grid).
+      for (const rec of this._laVectors) {
+        const p = rec.v;
+        const x = m[0] * p.x + m[3] * p.y + m[6] * p.z;
+        const y = m[1] * p.x + m[4] * p.y + m[7] * p.z;
+        const z = m[2] * p.x + m[5] * p.y + m[8] * p.z;
+        const dir = this._tmpVec3.set(x, y, z);
+        const len = dir.length();
+        if (len > 1e-6) {
+          rec.arrow.visible = true;
+          rec.arrow.setDirection(dir.clone().normalize());
+          rec.arrow.setLength(len, Math.min(0.5, len * 0.22), Math.min(0.3, len * 0.14));
+        } else {
+          rec.arrow.visible = false;
+        }
+      }
+    }
+
+    /**
+     * Build the 3D coordinate cage: three families of grid lines on the XY, XZ
+     * and YZ planes plus a Z axis, kept modest in extent so the line count stays
+     * cheap. Hidden until setLinearDimension('3d'). Morphs via _laWriteGeometry
+     * against `_la3DBasePoints` (same column-major transform as the 2D lattice).
+     */
+    _laBuild3DGrid() {
+      // Smaller than the 2D "infinite" plane — a readable boxed cage.
+      const M = 8;
+      this._la3DBasePoints = [];
+      const positions = [];
+      const seg = (ax, ay, az, bx, by, bz) => {
+        this._la3DBasePoints.push(new THREE.Vector3(ax, ay, az));
+        this._la3DBasePoints.push(new THREE.Vector3(bx, by, bz));
+        positions.push(0, 0, 0, 0, 0, 0);
+      };
+      for (let i = -M; i <= M; i++) {
+        seg(i, -M, 0, i, M, 0); seg(-M, i, 0, M, i, 0); // XY plane
+        seg(i, 0, -M, i, 0, M); seg(-M, 0, i, M, 0, i); // XZ plane
+        seg(0, i, -M, 0, i, M); seg(0, -M, i, 0, M, i); // YZ plane
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
+      const mat = new THREE.LineBasicMaterial({
+        color: 0x0f6b7a, transparent: true, opacity: 0.28,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      });
+      this._la3DGrid = new THREE.LineSegments(geo, mat);
+      this._la3DGrid.frustumCulled = false;
+      this._la3DGrid.visible = false;
+      this.laGroup.add(this._la3DGrid);
+
+      // Z axis line (X and Y already exist in _laBuildAxes).
+      const zGeo = new THREE.BufferGeometry();
+      zGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
+        0, 0, -this._laN, 0, 0, this._laN,
+      ]), 3));
+      this._laZAxis = new THREE.LineSegments(zGeo, new THREE.LineBasicMaterial({
+        color: 0x4a6b78, transparent: true, opacity: 0.85, depthWrite: false,
+      }));
+      this._laZAxis.frustumCulled = false;
+      this._laZAxis.visible = false;
+      this.laGroup.add(this._laZAxis);
+    }
+
+    /**
+     * Switch between the flat 2D plane and the full 3D cage. In 3D the flat
+     * lattice is hidden in favour of the three-plane cage + Z axis, and the
+     * camera pulls back to a livelier orbit tilt so depth reads clearly.
+     */
+    setLinearDimension(mode) {
+      const three = mode === '3d';
+      this._la3D = three;
+      this._la3DGrid.visible = three;
+      this._laZAxis.visible = three;
+      // In 3D, dim the "infinite" flat plane so the cage doesn't fight it; the
+      // live+ref flat grids are the 2D stage, so hide them in 3D.
+      this._laLiveGrid.visible = !three;
+      this._laRefGrid.visible = !three;
+      // Force a relabel (Z ticks appear/disappear) and re-apply current matrix.
+      this._laLastRangeKey = '';
+      if (three) {
+        this.field.rotation.set(-0.6, 0.7, 0, 'YXZ');
+        this._rotTarget.set(-0.6, 0.7, 0, 'YXZ');
+      } else {
+        this.field.rotation.set(-0.35, 0.45, 0, 'YXZ');
+        this._rotTarget.set(-0.35, 0.45, 0, 'YXZ');
+      }
+      this._laApplyDisplayed(this._laDisplayed.slice());
+    }
+
+    /** Colour ramp for successive user vectors (cycles). */
+    _laVecColor(i) {
+      const ramp = [0xffd166, 0x06d6a0, 0xef476f, 0x118ab2, 0xf78c6b, 0x9b5de5];
+      return ramp[i % ramp.length];
+    }
+
+    /**
+     * Add a user vector (x,y,z). Returns its id. The arrow is immediately placed
+     * under the current displayed matrix (so it animates in if a transform is
+     * active). Reuses the basis-arrow factory for a consistent look.
+     */
+    laAddVector(x, y, z) {
+      const color = this._laVecColor(this._laVecNextId - 1);
+      const arrow = this._makeBasisArrow(color);
+      this.laGroup.add(arrow);
+      const rec = { id: this._laVecNextId++, v: new THREE.Vector3(x, y, z), arrow };
+      this._laVectors.push(rec);
+      // Position it against whatever is currently displayed.
+      this._laApplyDisplayed(this._laDisplayed.slice());
+      return { id: rec.id, color };
+    }
+
+    /** Remove a user vector by id. */
+    laRemoveVector(id) {
+      const i = this._laVectors.findIndex((r) => r.id === id);
+      if (i === -1) return;
+      const [rec] = this._laVectors.splice(i, 1);
+      this.laGroup.remove(rec.arrow);
+      if (rec.arrow.dispose) rec.arrow.dispose();
+    }
+
+    /** Remove all user vectors (called on exit/reset). */
+    laClearVectors() {
+      for (const rec of this._laVectors) {
+        this.laGroup.remove(rec.arrow);
+        if (rec.arrow.dispose) rec.arrow.dispose();
+      }
+      this._laVectors = [];
     }
 
     /**
@@ -1161,12 +1338,15 @@
       this.field.rotation.set(-0.35, 0.45, 0, 'YXZ');
       this._rotTarget.set(-0.35, 0.45, 0, 'YXZ');
       this.resetMatrix(true);
+      // Always start in 2D; the UI toggle drives 3D.
+      if (this._la3D) this.setLinearDimension('2d');
     }
 
     /** Leave linear-algebra mode and restore the data-structure layer. */
     exitLinearMode() {
       this._laActive = false;
       this.laGroup.visible = false;
+      this.laClearVectors();
       for (const g of this.nodeMeshes.values()) g.visible = true;
       for (const g of this.edgeMeshes.values()) g.visible = true;
       this.grid.visible = true;
@@ -1199,7 +1379,13 @@
 
     /** Per-frame linear-algebra tween (called from _frame while active). */
     _updateLinearAlgebra(t) {
-      if (!this._laActive || this._laT >= 1) return;
+      if (!this._laActive) return;
+
+      // Zoom-adaptive coordinate labels run EVERY frame (zoom can change even
+      // when the matrix tween is settled), before the early-out below.
+      this._laRelabel();
+
+      if (this._laT >= 1) return;
       // Advance eased parameter by real elapsed delta.
       const last = this._laClockLast === undefined ? t : this._laClockLast;
       const dt = Math.max(0, t - last);
@@ -1211,6 +1397,61 @@
       const cur = this._laDisplayed;
       for (let i = 0; i < 9; i++) cur[i] = from[i] + (to[i] - from[i]) * e;
       this._laApplyDisplayed(cur);
+    }
+
+    /**
+     * Reposition + relabel the pooled number sprites from the current zoom. Picks
+     * a nice step, lays labels at multiples of it across the visible range on the
+     * X and Y axes (and Z when in 3D mode), hides the unused pool tail. Canvas
+     * redraws only happen when the step or visible range actually changed.
+     */
+    _laRelabel() {
+      const pool = this._laLabelPool;
+      if (!pool || !pool.length) return;
+
+      const camZ = this.camera.position.z;
+      const step = this._laNiceStep(camZ);
+      // Visible half-extent in world units (matches _laNiceStep's model), capped
+      // to the lattice bound so we never place labels past the grid.
+      const half = Math.min(this._laN, Math.max(step * 2, camZ * 0.62));
+      const kMax = Math.floor(half / step);
+      const rangeKey = step + ':' + kMax + ':' + (this._la3D ? '3' : '2');
+
+      // Nothing changed since last frame → skip the whole rebuild.
+      if (rangeKey === this._laLastRangeKey) return;
+      this._laLastRangeKey = rangeKey;
+      this._laLastStep = step;
+
+      const OFF = 0.42 * (step >= 10 ? 1.4 : 1);   // small offset from the axis
+      let p = 0;
+      const place = (text, x, y, z) => {
+        if (p >= pool.length) return;
+        const s = pool[p++];
+        this._laSetLabel(s, text);
+        s.position.set(x, y, z || 0);
+        s.visible = true;
+      };
+
+      // Origin marker.
+      place('0', -OFF, -OFF, 0);
+      // X and Y ticks at multiples of step (skip 0 — handled above).
+      for (let k = 1; k <= kMax; k++) {
+        const v = k * step;
+        place(String(v), v, -OFF, 0);
+        place(String(-v), -v, -OFF, 0);
+        place(String(v), -OFF, v, 0);
+        place(String(-v), -OFF, v * -1, 0);
+      }
+      // Z ticks only in 3D mode.
+      if (this._la3D) {
+        for (let k = 1; k <= kMax; k++) {
+          const v = k * step;
+          place(String(v), -OFF, 0, v);
+          place(String(-v), -OFF, 0, -v);
+        }
+      }
+      // Hide the unused tail.
+      for (; p < pool.length; p++) pool[p].visible = false;
     }
 
     /* ---------------------------------------------------------------------

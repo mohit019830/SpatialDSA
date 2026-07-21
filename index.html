@@ -126,6 +126,10 @@
         </nav>
         <div class="linalg-body hidden">
           <p class="hint">Columns are î ĵ k̂ — where each basis vector lands.</p>
+          <div class="la-dim-toggle" id="laDimToggle">
+            <button class="dim-btn active" data-dim="2d">2D</button>
+            <button class="dim-btn" data-dim="3d">3D</button>
+          </div>
           <div class="matrix-grid" id="matrixGrid">
             <input class="mx-cell" data-mx="0" type="number" step="0.1" value="1" />
             <input class="mx-cell" data-mx="3" type="number" step="0.1" value="0" />
@@ -147,6 +151,16 @@
             <button class="btn-mini" data-preset="shearX">Shear X</button>
             <button class="btn-mini" data-preset="reflectX">Reflect X</button>
             <button class="btn-mini" data-preset="squash">Collapse</button>
+          </div>
+          <div class="la-vec-panel hidden" id="laVecInputs">
+            <p class="hint">Insert vectors — they transform with the matrix.</p>
+            <div class="la-vec-row">
+              <input class="mx-cell" id="laVecX" type="number" step="0.5" value="1" aria-label="x" />
+              <input class="mx-cell" id="laVecY" type="number" step="0.5" value="1" aria-label="y" />
+              <input class="mx-cell" id="laVecZ" type="number" step="0.5" value="1" aria-label="z" />
+              <button class="btn-mini" id="btnAddVector">Add Vector</button>
+            </div>
+            <ul class="la-vec-list" id="laVecList"></ul>
           </div>
         </div>
       </section>

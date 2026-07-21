@@ -72,6 +72,13 @@
     btnApplyMatrix: $('#btnApplyMatrix'),
     btnResetMatrix: $('#btnResetMatrix'),
     linalgPresets: $('#linalgPresets'),
+    laDimToggle: $('#laDimToggle'),
+    laVecInputs: $('#laVecInputs'),
+    laVecX: $('#laVecX'),
+    laVecY: $('#laVecY'),
+    laVecZ: $('#laVecZ'),
+    btnAddVector: $('#btnAddVector'),
+    laVecList: $('#laVecList'),
     // recursion visualizer
     recViewTabs: $('#recViewTabs'),
     recStatus: $('#recStatus'),
@@ -540,7 +547,7 @@
      * pinch still rotates the grid. Handle it and return before the DS layers.
      * Two-handed zoom already returned above, so camera dolly still works. */
     if (linearMode) {
-      handleLinearGesture(evt, worldPoint);
+      handleLinearGesture(evt);
       return;
     }
 
@@ -587,12 +594,26 @@
 
   /* -------------------------------------------------------------------------
    * LINEAR-ALGEBRA PINCH GRAMMAR.
-   *   pinch near î/ĵ tip → grab + drag that basis vector (reshapes matrix).
-   *   pinch in open space → rotate the grid (reuses the field rotate path).
-   *   release            → settle the matrix into the form + det badge.
+   *   pinch near î/ĵ/k̂ tip → grab + drag that basis vector (reshapes matrix).
+   *   pinch in open space   → rotate the grid (reuses the field rotate path).
+   *   release               → settle the matrix into the form + det badge.
    * Hover (no pinch) highlights the grabbable arrow under the cursor.
+   *
+   * Routes through the SAME screen-space pick/drag the mouse uses
+   * (laPickScreen / laDragScreen), so all three arrows — including the purple
+   * k̂ that points toward the camera — are grabbable and drags stay correct in
+   * both 2D and 3D. The vision cursor's normalized 0..1 coords map to canvas
+   * pixels via the shared NDC convention.
    * ---------------------------------------------------------------------- */
-  function handleLinearGesture(evt, worldPoint) {
+  function cursorToClient(cursor) {
+    const rect = els.scene.getBoundingClientRect();
+    return {
+      x: rect.left + cursor.x * rect.width,
+      y: rect.top + cursor.y * rect.height,
+    };
+  }
+
+  function handleLinearGesture(evt) {
     // Hand gone: release any in-flight grab, drop rotate.
     if (!evt.present || !evt.cursor) {
       if (renderer.laIsGrabbing) syncMatrixFromRenderer(renderer.laReleaseBasis());
@@ -601,20 +622,22 @@
       return;
     }
 
+    const c = cursorToClient(evt.cursor);
+
     if (evt.pinchStart) {
       // Prefer grabbing a basis tip; fall back to rotating the grid.
-      const pick = renderer.laBasisPick(worldPoint);
+      const pick = renderer.laPickScreen(c.x, c.y);
       if (pick !== null && renderer.laGrabBasis(pick)) {
         gesture.mode = MODE.LA_DRAG;
         setMode('LA_DRAG');
       } else {
         gesture.mode = MODE.ROTATE;
-        gesture.lastCursor = evt.cursor ? { x: evt.cursor.x, y: evt.cursor.y } : null;
+        gesture.lastCursor = { x: evt.cursor.x, y: evt.cursor.y };
         setMode('ROTATE');
       }
     } else if (evt.pinch) {
       if (gesture.mode === MODE.LA_DRAG) {
-        syncMatrixFromRenderer(renderer.laDragBasisTo(worldPoint));
+        syncMatrixFromRenderer(renderer.laDragScreen(c.x, c.y));
       } else if (gesture.mode === MODE.ROTATE && evt.cursor && gesture.lastCursor) {
         const dnx = evt.cursor.x - gesture.lastCursor.x;
         const dny = evt.cursor.y - gesture.lastCursor.y;
@@ -626,7 +649,7 @@
       onPinchEnd();
     } else {
       // Idle hand: just highlight the arrow the cursor is near.
-      renderer.laHighlightBasis(renderer.laBasisPick(worldPoint));
+      renderer.laHighlightBasis(renderer.laPickScreen(c.x, c.y));
     }
   }
 
@@ -1345,6 +1368,19 @@ int main() {
 }
 `;
 
+  // Reset the 2D/3D toggle back to 2D and hide/clear the vector UI. Called on
+  // entering and leaving Grid Transform so each visit starts in a clean state.
+  function resetLaDimUI() {
+    const toggle = els.laDimToggle;
+    if (toggle) {
+      toggle.querySelectorAll('.dim-btn').forEach((b) =>
+        b.classList.toggle('active', b.getAttribute('data-dim') === '2d'));
+    }
+    if (els.laVecInputs) els.laVecInputs.classList.add('hidden');
+    if (els.laVecList) els.laVecList.innerHTML = '';
+    if (renderer && renderer.setLinearDimension) renderer.setLinearDimension('2d');
+  }
+
   function wireLinearAlgebra() {
     // Mode toggle: Data Structure ↔ Grid Transform.
     els.linalgModeTabs.addEventListener('click', (e) => {
@@ -1366,6 +1402,8 @@ int main() {
           renderer.exitRecursionMode();
         }
         renderer.enterLinearMode();
+        // Always start in 2D — reset the toggle + hide the vector panel.
+        resetLaDimUI();
         const m = readMatrixCells();
         renderer.applyMatrix(m);
         updateDetBadge(m);
@@ -1374,6 +1412,7 @@ int main() {
           'Grab î (green) or ĵ (red) and drag to reshape the matrix. Pinch/mouse both work.';
       } else {
         renderer.exitLinearMode();
+        resetLaDimUI();
         renderer.resumeAutoOrbit();
         setMode('IDLE');
         // Coming out of LA mode, re-enter recursion if a recursive algo is live.
@@ -1408,6 +1447,42 @@ int main() {
       writeMatrixCells(preset);
       renderer.applyMatrix(preset);
       updateDetBadge(preset);
+    });
+
+    // 2D / 3D toggle: switch the renderer's coordinate stage + reveal vector UI.
+    els.laDimToggle.addEventListener('click', (e) => {
+      const btn = e.target.closest('.dim-btn');
+      if (!btn || !renderer) return;
+      const dim = btn.getAttribute('data-dim');
+      els.laDimToggle.querySelectorAll('.dim-btn')
+        .forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      renderer.setLinearDimension(dim);
+      els.laVecInputs.classList.toggle('hidden', dim !== '3d');
+      els.hudDesc.textContent = dim === '3d'
+        ? 'Insert x/y/z vectors below — apply a matrix and watch them transform in 3D.'
+        : 'Grab î (green) or ĵ (red) and drag to reshape the matrix. Pinch/mouse both work.';
+    });
+
+    // Add a user vector from the x/y/z fields; append a removable list row.
+    els.btnAddVector.addEventListener('click', () => {
+      if (!renderer) return;
+      const x = parseFloat(els.laVecX.value) || 0;
+      const y = parseFloat(els.laVecY.value) || 0;
+      const z = parseFloat(els.laVecZ.value) || 0;
+      if (x === 0 && y === 0 && z === 0) return;
+      const { id, color } = renderer.laAddVector(x, y, z);
+      const hex = '#' + color.toString(16).padStart(6, '0');
+      const li = document.createElement('li');
+      li.innerHTML =
+        `<span><span class="vec-swatch" style="background:${hex}"></span>` +
+        `(${x}, ${y}, ${z})</span>` +
+        `<button class="vec-del" aria-label="remove">×</button>`;
+      li.querySelector('.vec-del').addEventListener('click', () => {
+        renderer.laRemoveVector(id);
+        li.remove();
+      });
+      els.laVecList.appendChild(li);
     });
   }
 
