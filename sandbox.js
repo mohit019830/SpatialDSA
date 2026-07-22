@@ -57,6 +57,16 @@
   const JSCPP_VERSION = '2.0.2';
   const JSCPP_CDN = `https://cdn.jsdelivr.net/npm/JSCPP@${JSCPP_VERSION}/dist/JSCPP.es5.min.js`;
 
+  // Pinned Skulpt build (pure-JS Python interpreter). Like JSCPP, the worker
+  // importScripts() these EXACT URLs — the main bundle + the stdlib bundle.
+  // Tier 1: Python runs, stdout + @VIS:HIGHLIGHT stream to the visualizer; the
+  // automatic Stack Tower (frame introspection) is a later tier, so the Python
+  // worker emits no `frames` and the main thread degrades to line-free output
+  // exactly as it already does for C++ builds without debug introspection.
+  const SKULPT_VERSION = '1.2.0';
+  const SKULPT_CDN = `https://cdn.jsdelivr.net/npm/skulpt@${SKULPT_VERSION}/dist/skulpt.min.js`;
+  const SKULPT_STDLIB_CDN = `https://cdn.jsdelivr.net/npm/skulpt@${SKULPT_VERSION}/dist/skulpt-stdlib.js`;
+
   // Hard wall-clock ceiling. JSCPP's maxTimeout only checks between operations,
   // so a tight empty loop can slip past it — this terminate() is the real guard.
   const HARD_TIMEOUT_MS = 5000;
@@ -358,6 +368,81 @@
     `;
   }
 
+  /* ---------------------------------------------------------------------
+   * PYTHON worker body (Skulpt). Tier 1: run the program, stream stdout
+   * (including any @VIS:HIGHLIGHT lines the program prints) via the SAME
+   * message protocol the C++ worker uses. No `frames` are emitted yet, so
+   * the main thread degrades to output-only (no Stack Tower) — the exact
+   * graceful path already exercised by C++ builds without introspection.
+   *
+   * stdin is exposed to Python's input()/sys.stdin via Sk.inputfun-style
+   * reads over a buffered queue. Skulpt is synchronous; the outer
+   * HARD_TIMEOUT_MS terminate() in the main thread is the infinite-loop guard.
+   * ------------------------------------------------------------------ */
+  function pyWorkerSource(skulptUrl, stdlibUrl) {
+    return `
+      try {
+        importScripts(${JSON.stringify(skulptUrl)});
+        importScripts(${JSON.stringify(stdlibUrl)});
+      } catch (e) {
+        self.postMessage({ type: 'error', message: 'Failed to load Skulpt from CDN: ' + e.message });
+        self.postMessage({ type: 'done' });
+        return;
+      }
+
+      self.onmessage = function (ev) {
+        var code = ev.data && ev.data.code;
+        if (typeof code !== 'string') return;
+        var stdin = (ev.data && typeof ev.data.stdin === 'string') ? ev.data.stdin : '';
+
+        // Feed stdin line-by-line to input()/raw_input(). Skulpt calls inputfun
+        // per read; we hand back one line at a time (trailing newline stripped).
+        var inLines = stdin.length ? stdin.replace(/\\n$/, '').split('\\n') : [];
+        var inPtr = 0;
+
+        function outf(text) {
+          self.postMessage({ type: 'stdout', chunk: text });
+        }
+        function readf(x) {
+          // Skulpt's module loader uses this to fetch builtin sources.
+          if (Sk.builtinFiles === undefined || Sk.builtinFiles.files[x] === undefined) {
+            throw new Error("File not found: '" + x + "'");
+          }
+          return Sk.builtinFiles.files[x];
+        }
+        function inputf() {
+          return inPtr < inLines.length ? inLines[inPtr++] : '';
+        }
+
+        try {
+          Sk.configure({
+            output: outf,
+            read: readf,
+            inputfun: inputf,
+            inputfunTakesPrompt: true,
+            __future__: Sk.python3,
+            execLimit: 8000,   // ms; coarse guard, terminate() is the real one
+          });
+          var promise = Sk.misceval.asyncToPromise(function () {
+            return Sk.importMainWithBody('<stdin>', false, code, true);
+          });
+          promise.then(function () {
+            self.postMessage({ type: 'exit', code: 0 });
+            self.postMessage({ type: 'done' });
+          }, function (err) {
+            var msg = (err && err.toString) ? err.toString() : String(err);
+            self.postMessage({ type: 'error', message: msg });
+            self.postMessage({ type: 'done' });
+          });
+        } catch (e) {
+          var m = (e && e.toString) ? e.toString() : String(e);
+          self.postMessage({ type: 'error', message: m });
+          self.postMessage({ type: 'done' });
+        }
+      };
+    `;
+  }
+
   class SandboxEngine {
     /**
      * @param {object} opts
@@ -375,6 +460,7 @@
       this.getCode = opts.getCode;
       this.getStdin = opts.getStdin || (() => '');
       this.getFormat = opts.getFormat || (() => 'raw');
+      this.getLanguage = opts.getLanguage || (() => 'cpp');
       this.hooks = opts.hooks || {};
 
       this._worker = null;
@@ -397,12 +483,15 @@
 
     run() {
       if (this._running) return;
+      const lang = (this.getLanguage ? this.getLanguage() : 'cpp') || 'cpp';
+      const langName = lang === 'python' ? 'Python' : 'C++';
       const code = (this.getCode ? this.getCode() : '') || '';
       if (!code.trim()) {
         this._status('error', 'nothing to run');
-        this._term('No C++ source to run.', 'err');
+        this._term(`No ${langName} source to run.`, 'err');
         return;
       }
+      this._lang = lang;
 
       // Standard input (test cases). Normalize CRLF → LF so cin/getline see the
       // line breaks JSCPP expects, and guarantee a trailing newline so the final
@@ -433,9 +522,11 @@
 
       if (this.hooks.onRunStart) this.hooks.onRunStart();
       this._status('loading', 'running…');
-      this._term('▶ Running C++ in sandboxed worker (debug trace)…', 'dim');
+      this._term(lang === 'python'
+        ? '▶ Running Python in sandboxed worker (Skulpt)…'
+        : '▶ Running C++ in sandboxed worker (debug trace)…', 'dim');
 
-      if (stdin.length) this._term(`↳ stdin: ${stdin.split('\n').length - 1} line(s) fed to cin.`, 'dim');
+      if (stdin.length) this._term(`↳ stdin: ${stdin.split('\n').length - 1} line(s) fed to ${lang === 'python' ? 'input()' : 'cin'}.`, 'dim');
 
       // AUTO-SETUP: draw the test case on the canvas before the program runs, so
       // step 0 already shows the data structure and the id map is ready for any
@@ -525,7 +616,9 @@
     /* ---- worker plumbing ------------------------------------------- */
 
     _spawnWorker(code, stdin) {
-      const src = workerSource(JSCPP_CDN, JSCPP_MAXTIMEOUT_MS, MAX_RAW_STEPS, MAX_EMIT_STEPS);
+      const src = this._lang === 'python'
+        ? pyWorkerSource(SKULPT_CDN, SKULPT_STDLIB_CDN)
+        : workerSource(JSCPP_CDN, JSCPP_MAXTIMEOUT_MS, MAX_RAW_STEPS, MAX_EMIT_STEPS);
       const blob = new Blob([src], { type: 'application/javascript' });
       const url = URL.createObjectURL(blob);
       const w = new Worker(url);

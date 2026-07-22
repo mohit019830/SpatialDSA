@@ -109,6 +109,9 @@
     btnRunCpp: $('#btnRunCpp'),
     btnStopCpp: $('#btnStopCpp'),
     btnCppExample: $('#btnCppExample'),
+    sandboxLangTabs: $('#sandboxLangTabs'),
+    sandboxHintCpp: $('#sandboxHintCpp'),
+    sandboxHintPy: $('#sandboxHintPy'),
     // global input
     btnGestureToggle: $('#btnGestureToggle'),
     // hud
@@ -226,6 +229,7 @@
   // True while a custom-C++ sandbox run is on the stage. Unlike recursionMode,
   // the DS layer stays visible (nodes + edges + call-stack overlay together).
   let sandboxMode = false;
+  let sandboxLang = 'cpp';   // active sandbox language: 'cpp' | 'python'
   let sandbox = null;   // Sandbox.SandboxEngine, created in boot()
 
   // Ghost-node guard: never spawn within this of an existing node.
@@ -1443,6 +1447,7 @@
         (window.__cppEditor ? window.__cppEditor.getValue() : ''),
       getStdin: () => (els.cppStdin ? els.cppStdin.value : ''),
       getFormat: () => (els.testCaseFormat ? els.testCaseFormat.value : 'raw'),
+      getLanguage: () => sandboxLang,
       hooks: {
         onStatus: (kind, text) => setCppStatus(kind, text),
         onTerminal: (text, kind) => appendTerminal(text, kind),
@@ -1465,6 +1470,36 @@
       },
     });
 
+    // Language tabs (C++ ↔ Python): swap editor highlighting + default source,
+    // and toggle which help text shows. The SandboxEngine reads sandboxLang.
+    if (els.sandboxLangTabs) {
+      els.sandboxLangTabs.addEventListener('click', (e) => {
+        const btn = e.target.closest('.tab');
+        if (!btn) return;
+        const lang = btn.getAttribute('data-lang');
+        if (lang === sandboxLang) return;
+        sandboxLang = lang;
+        els.sandboxLangTabs.querySelectorAll('.tab')
+          .forEach((t) => t.classList.toggle('active', t === btn));
+        // Editor: swap syntax highlighting + load that language's default source
+        // (only if the editor still holds the OTHER language's default, so we
+        // never clobber code the user has edited).
+        if (window.__cppEditor) {
+          if (window.__cppEditor.setLanguage) window.__cppEditor.setLanguage(lang);
+          const defs = window.__cppEditor.defaults;
+          if (defs) {
+            const cur = window.__cppEditor.getValue().trim();
+            const isUntouched = cur === defs.cpp.trim() || cur === defs.python.trim() || cur === '';
+            if (isUntouched) window.__cppEditor.setValue(defs[lang] || '');
+          }
+        }
+        // Help text.
+        if (els.sandboxHintCpp) els.sandboxHintCpp.classList.toggle('hidden', lang !== 'cpp');
+        if (els.sandboxHintPy) els.sandboxHintPy.classList.toggle('hidden', lang !== 'python');
+        setCppStatus('idle', 'idle');
+      });
+    }
+
     els.btnRunCpp.addEventListener('click', () => {
       if (!window.__cppEditorReady) {
         appendTerminal('Editor still loading — try again in a moment.', 'dim');
@@ -1480,12 +1515,36 @@
     });
 
     els.btnCppExample.addEventListener('click', () => {
-      if (window.__cppEditor) window.__cppEditor.setValue(EXAMPLE_CPP);
-      if (els.cppStdin) els.cppStdin.value = EXAMPLE_STDIN;
-      if (els.testCaseFormat) els.testCaseFormat.value = 'raw';
-      appendTerminal('Loaded example: recursive Fibonacci. The branching call tree, live args, and return values all draw automatically — no @VIS commands.', 'dim');
+      if (sandboxLang === 'python') {
+        const defs = window.__cppEditor && window.__cppEditor.defaults;
+        if (window.__cppEditor) window.__cppEditor.setValue(defs ? defs.python : EXAMPLE_PY);
+        if (els.cppStdin) els.cppStdin.value = '';
+        if (els.testCaseFormat) els.testCaseFormat.value = 'raw';
+        appendTerminal('Loaded Python example: recursive Fibonacci. Output + @VIS:HIGHLIGHT node lighting stream to the terminal / canvas.', 'dim');
+      } else {
+        if (window.__cppEditor) window.__cppEditor.setValue(EXAMPLE_CPP);
+        if (els.cppStdin) els.cppStdin.value = EXAMPLE_STDIN;
+        if (els.testCaseFormat) els.testCaseFormat.value = 'raw';
+        appendTerminal('Loaded example: recursive Fibonacci. The branching call tree, live args, and return values all draw automatically — no @VIS commands.', 'dim');
+      }
     });
   }
+
+  // Fallback Python example if the editor shim didn't expose defaults.
+  const EXAMPLE_PY = `# Recursive Fibonacci in Python.
+def fib(n):
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+print("@VIS:NODE:1:0")
+print("@VIS:NODE:2:1")
+print("@VIS:EDGE:1:2")
+for u in (1, 2):
+    print("@VIS:HIGHLIGHT:%d" % u)
+
+print("fib(6) =", fib(6))
+`;
 
   // DEFAULT example: plain mathematical recursion. Nothing is annotated — the
   // debugger reads each fib(n) activation off the call stack, spawns a call-graph

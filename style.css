@@ -498,6 +498,10 @@ html, body {
 .cpp-terminal .t-dim { color: var(--text-dim); }
 .cpp-terminal .t-line { display: block; }
 
+/* Sandbox language tabs + per-language help text toggle. */
+#sandboxLangTabs { margin-bottom: 8px; }
+.hint.hidden { display: none; }
+
 .sandbox-card .hint code {
   color: var(--cyan); background: rgba(0,243,255,.08);
   padding: 0 3px; border-radius: 3px; font-size: 10px;
