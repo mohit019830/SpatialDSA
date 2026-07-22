@@ -69,7 +69,15 @@
           <button class="tab" data-algo="bstInsert">BST Insert</button>
           <button class="tab" data-algo="bstDelete">BST Delete</button>
           <button class="tab" data-algo="dfs">DFS</button>
+          <button class="tab" data-algo="bfs">BFS</button>
           <button class="tab" data-algo="dijkstra">Dijkstra</button>
+          <button class="tab" data-algo="stack">Stack</button>
+          <button class="tab" data-algo="queue">Queue</button>
+          <button class="tab" data-algo="hashTable">Hash Table</button>
+          <button class="tab" data-algo="heap">Min-Heap</button>
+          <button class="tab" data-algo="quickSort">Quicksort</button>
+          <button class="tab" data-algo="bubbleSort">Bubble Sort</button>
+          <button class="tab" data-algo="insertionSort">Insertion Sort</button>
           <button class="tab" data-algo="fibonacci">Fibonacci</button>
           <button class="tab" data-algo="mergeSort">Merge Sort</button>
           <button class="tab" data-algo="dfsRecursive">Rec. DFS</button>
@@ -95,6 +103,38 @@
         </div>
       </section>
 
+      <!-- Playback & Insight: complexity, counters, variables, speed + scrubber -->
+      <section class="card insight-card">
+        <div class="card-head">
+          <h2>Playback &amp; Insight</h2>
+          <span id="complexityBadge" class="desc-badge">O(?)</span>
+        </div>
+        <div class="insight-body">
+          <div id="opCounters" class="op-counters">
+            <span class="op-chip">cmp <b id="opCmp">0</b></span>
+            <span class="op-chip">swap <b id="opSwap">0</b></span>
+            <span class="op-chip">visit <b id="opVisit">0</b></span>
+          </div>
+          <div class="scrubber-row">
+            <button class="btn-mini" id="btnScrubBack">◀</button>
+            <input type="range" id="stepScrubber" min="0" max="0" value="0" step="1"
+              aria-label="Step timeline" />
+            <button class="btn-mini" id="btnScrubFwd">▶</button>
+          </div>
+          <div class="scrubber-readout"><span id="scrubReadout">step —</span></div>
+          <div class="speed-row">
+            <label for="playSpeed">Speed</label>
+            <input type="range" id="playSpeed" min="150" max="1500" step="50" value="900"
+              aria-label="Playback speed" />
+            <span id="playSpeedVal" class="speed-val">0.9s</span>
+          </div>
+          <div class="var-inspector">
+            <div class="var-title">Variables</div>
+            <ul id="varList" class="var-list"><li class="var-empty">— build a trace —</li></ul>
+          </div>
+        </div>
+      </section>
+
       <!-- Text-based structural input → auto-layout -->
       <section class="card struct-card">
         <div class="card-head">
@@ -104,6 +144,7 @@
         <nav class="tabs" id="structFormatTabs">
           <button class="tab active" data-format="tree">Binary Tree</button>
           <button class="tab" data-format="graph">Graph / Edges</button>
+          <button class="tab" data-format="array">Array</button>
         </nav>
         <textarea id="structInput" class="struct-input" rows="3"
           spellcheck="false"
@@ -145,12 +186,26 @@
             <button class="btn" id="btnApplyMatrix">Apply ▶</button>
             <button class="btn btn-ghost" id="btnResetMatrix">Identity</button>
           </div>
+          <div class="controls-row">
+            <button class="btn btn-ghost" id="btnUndoMatrix" title="Step back through applied matrices" disabled>↶ Undo</button>
+            <button class="btn btn-ghost" id="btnInvertMatrix" title="Apply the inverse of the current matrix">M⁻¹ Inverse</button>
+          </div>
           <div class="preset-row" id="linalgPresets">
             <button class="btn-mini" data-preset="rotate90">Rotate 90°</button>
             <button class="btn-mini" data-preset="scale2">Scale 2×</button>
             <button class="btn-mini" data-preset="shearX">Shear X</button>
             <button class="btn-mini" data-preset="reflectX">Reflect X</button>
             <button class="btn-mini" data-preset="squash">Collapse</button>
+          </div>
+          <div class="la-options">
+            <label class="la-check"><input type="checkbox" id="laSnapToggle" /> Snap to integers while dragging</label>
+            <label class="la-check"><input type="checkbox" id="laEigenToggle" /> Show eigenvectors <span class="la-swatch-gold"></span></label>
+            <label class="la-check"><input type="checkbox" id="laDetToggle" /> Show det area / volume</label>
+            <div class="la-speed-row">
+              <label for="laSpeed">Speed</label>
+              <input type="range" id="laSpeed" min="0.2" max="4" step="0.1" value="2" />
+              <span id="laSpeedVal" class="la-speed-val">2.0s</span>
+            </div>
           </div>
           <div class="la-vec-panel hidden" id="laVecInputs">
             <p class="hint">Insert vectors — they transform with the matrix.</p>
@@ -279,12 +334,12 @@
   <!-- App modules. Order matters: engines first, orchestrator last. -->
   <!-- ?v= cache-buster: bump when editing local scripts so the browser can't
        serve a stale copy (no build step = aggressive default caching). -->
-  <script src="dsaEngine.js?v=2"></script>
-  <script src="render3d.js?v=2"></script>
-  <script src="vision.js?v=2"></script>
-  <script src="speech.js?v=2"></script>
-  <script src="sandbox.js?v=2"></script>
-  <script src="app.js?v=2"></script>
+  <script src="dsaEngine.js?v=4"></script>
+  <script src="render3d.js?v=4"></script>
+  <script src="vision.js?v=4"></script>
+  <script src="speech.js?v=4"></script>
+  <script src="sandbox.js?v=4"></script>
+  <script src="app.js?v=4"></script>
 
   <!-- CodeMirror bootstrap (module). Builds the editor and exposes a tiny shim
        on window.__cppEditor: { getValue(), setValue(str) }. If the CDN import

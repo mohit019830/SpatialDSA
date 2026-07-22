@@ -79,9 +79,28 @@
     laVecZ: $('#laVecZ'),
     btnAddVector: $('#btnAddVector'),
     laVecList: $('#laVecList'),
+    btnUndoMatrix: $('#btnUndoMatrix'),
+    btnInvertMatrix: $('#btnInvertMatrix'),
+    laSnapToggle: $('#laSnapToggle'),
+    laEigenToggle: $('#laEigenToggle'),
+    laDetToggle: $('#laDetToggle'),
+    laSpeed: $('#laSpeed'),
+    laSpeedVal: $('#laSpeedVal'),
     // recursion visualizer
     recViewTabs: $('#recViewTabs'),
     recStatus: $('#recStatus'),
+    // playback & insight
+    complexityBadge: $('#complexityBadge'),
+    opCmp: $('#opCmp'),
+    opSwap: $('#opSwap'),
+    opVisit: $('#opVisit'),
+    stepScrubber: $('#stepScrubber'),
+    btnScrubBack: $('#btnScrubBack'),
+    btnScrubFwd: $('#btnScrubFwd'),
+    scrubReadout: $('#scrubReadout'),
+    playSpeed: $('#playSpeed'),
+    playSpeedVal: $('#playSpeedVal'),
+    varList: $('#varList'),
     // custom C++ sandbox
     cppStatus: $('#cppStatus'),
     cppTerminal: $('#cppTerminal'),
@@ -111,10 +130,43 @@
     fibonacci: 'FIBONACCI',
     mergeSort: 'MERGE SORT',
     dfsRecursive: 'REC. DFS',
+    stack: 'STACK',
+    queue: 'QUEUE',
+    hashTable: 'HASH TABLE',
+    heap: 'MIN-HEAP',
+    quickSort: 'QUICKSORT',
+    bubbleSort: 'BUBBLE SORT',
+    insertionSort: 'INSERTION SORT',
+    bfs: 'BFS',
   };
 
   /** Algorithms that drive the recursion visualizer (call tree + stack). */
   const RECURSIVE_ALGOS = new Set(['fibonacci', 'mergeSort', 'dfsRecursive']);
+
+  /** Big-O time/space per algorithm, shown in the Playback & Insight badge. */
+  const ALGO_COMPLEXITY = {
+    linkedListReversal: { time: 'O(n)', space: 'O(1)' },
+    bstInsert: { time: 'O(h)', space: 'O(h)' },
+    bstDelete: { time: 'O(h)', space: 'O(h)' },
+    dfs: { time: 'O(V+E)', space: 'O(V)' },
+    bfs: { time: 'O(V+E)', space: 'O(V)' },
+    dijkstra: { time: 'O(E log V)', space: 'O(V)' },
+    fibonacci: { time: 'O(2ⁿ)', space: 'O(n)' },
+    mergeSort: { time: 'O(n log n)', space: 'O(n)' },
+    dfsRecursive: { time: 'O(V+E)', space: 'O(V)' },
+    stack: { time: 'O(1) ops', space: 'O(n)' },
+    queue: { time: 'O(1) ops', space: 'O(n)' },
+    hashTable: { time: 'O(1) avg', space: 'O(n)' },
+    heap: { time: 'O(log n) push', space: 'O(n)' },
+    quickSort: { time: 'O(n log n) avg', space: 'O(log n)' },
+    bubbleSort: { time: 'O(n²)', space: 'O(1)' },
+    insertionSort: { time: 'O(n²)', space: 'O(1)' },
+  };
+
+  function updateComplexityBadge(algo) {
+    const c = ALGO_COMPLEXITY[algo];
+    els.complexityBadge.textContent = c ? `${c.time} · ${c.space}` : 'O(?)';
+  }
 
   /* =========================================================================
    * Engine instances
@@ -327,6 +379,74 @@
       ? `STEP ${state.stepIndex + 1}/${state.stepCount}`
       : 'STEP --';
     els.algoBadge.textContent = ALGO_LABELS[state.algorithm] || state.algorithm;
+
+    // --- Playback & Insight panel ------------------------------------------
+    updateInsightPanel(state);
+  }
+
+  /**
+   * Refresh the Playback & Insight card from the current step: op counters, the
+   * timeline scrubber position/extent, and the variable inspector. All cheap
+   * text/DOM updates gated so we don't thrash when nothing changed.
+   */
+  let _lastVarsKey = null;
+  function updateInsightPanel(state) {
+    // Operation counters (running tally snapshot at this step).
+    const s = state.stats || { comparisons: 0, swaps: 0, visits: 0 };
+    els.opCmp.textContent = s.comparisons || 0;
+    els.opSwap.textContent = s.swaps || 0;
+    els.opVisit.textContent = s.visits || 0;
+
+    // Timeline scrubber: sync max + value to the trace without firing input.
+    if (state.playing && state.stepCount > 0) {
+      els.stepScrubber.max = String(state.stepCount - 1);
+      els.stepScrubber.value = String(state.stepIndex);
+      els.scrubReadout.textContent = `step ${state.stepIndex + 1} / ${state.stepCount}`;
+    } else {
+      els.stepScrubber.max = '0';
+      els.stepScrubber.value = '0';
+      els.scrubReadout.textContent = 'step —';
+    }
+
+    // Variable inspector: prefer explicit step.vars; fall back to the recursion
+    // frame's top-of-stack locals for the recursion-view algorithms.
+    let vars = state.vars;
+    if ((!vars || !vars.length) && state.frame && state.frame.stack && state.frame.stack.length) {
+      const top = state.frame.stack[state.frame.stack.length - 1];
+      vars = [
+        ...(top.args || []).map((a) => ({ name: a.name, value: a.value })),
+        ...(top.locals || []).map((l) => ({ name: l.name, value: l.value })),
+      ];
+    }
+    const key = vars && vars.length
+      ? vars.map((v) => `${v.name}=${v.value}`).join('|') : (state.playing ? '∅' : null);
+    if (key !== _lastVarsKey) {
+      _lastVarsKey = key;
+      renderVarList(vars, state.playing);
+    }
+  }
+
+  function renderVarList(vars, playing) {
+    const ul = els.varList;
+    ul.innerHTML = '';
+    if (!vars || !vars.length) {
+      const li = document.createElement('li');
+      li.className = 'var-empty';
+      li.textContent = playing ? '(no tracked variables)' : '— build a trace —';
+      ul.appendChild(li);
+      return;
+    }
+    for (const v of vars) {
+      const li = document.createElement('li');
+      li.innerHTML = `<span class="var-name">${escapeHtml(String(v.name))}</span>` +
+        `<span class="var-val">${escapeHtml(String(v.value))}</span>`;
+      ul.appendChild(li);
+    }
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/[&<>"]/g, (c) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   }
 
   engine.onChange((state) => {
@@ -709,6 +829,7 @@
   }
 
   let executeTimer = null;
+  let execSpeedMs = 900;            // playback interval, driven by the speed slider
   function execute() {
     stopExecute();
     // Build the (potentially large) trace off the current frame.
@@ -721,11 +842,21 @@
       executeTimer = setInterval(() => {
         const advanced = engine.stepForward();
         if (!advanced) stopExecute();
-      }, 900);
+      }, execSpeedMs);
     });
   }
   function stopExecute() {
     if (executeTimer) { clearInterval(executeTimer); executeTimer = null; }
+  }
+
+  /** Restart the auto-play interval at the current speed (if playing). */
+  function restartPlaybackTimer() {
+    if (!executeTimer) return;
+    clearInterval(executeTimer);
+    executeTimer = setInterval(() => {
+      const advanced = engine.stepForward();
+      if (!advanced) stopExecute();
+    }, execSpeedMs);
   }
 
   /**
@@ -740,7 +871,7 @@
     executeTimer = setInterval(() => {
       const advanced = engine.stepForward();
       if (!advanced) stopExecute();
-    }, 900);
+    }, execSpeedMs);
   }
 
   function clearAll() {
@@ -811,6 +942,7 @@
       // Re-render the source immediately (engine._resetTrace emits nothing here).
       renderCode(algo, -1);
       els.algoBadge.textContent = ALGO_LABELS[algo] || algo;
+      updateComplexityBadge(algo);
       syncRecursionMode(algo);
     });
 
@@ -1042,6 +1174,7 @@
   const STRUCT_EXAMPLES = {
     tree: '[3, 9, 20, null, null, 15, 7]',
     graph: '[[0,1],[1,2],[2,0],[1,3],[3,4],[2,4]]',
+    array: '5, 2, 8, 1, 9, 3, 7',
   };
   // The format the structure panel is currently set to.
   let structFormat = 'tree';
@@ -1061,9 +1194,10 @@
       btn.classList.add('active');
       structFormat = btn.getAttribute('data-format');
       els.structInput.placeholder = STRUCT_EXAMPLES[structFormat];
-      setStructStatus(structFormat === 'tree'
-        ? 'level-order array, nulls allowed'
-        : 'edge list e.g. [[0,1],[1,2]]', false);
+      setStructStatus(
+        structFormat === 'tree' ? 'level-order array, nulls allowed'
+          : structFormat === 'graph' ? 'edge list e.g. [[0,1],[1,2]]'
+            : 'comma-separated values e.g. 5, 2, 8, 1', false);
     });
 
     els.btnStructExample.addEventListener('click', () => {
@@ -1082,12 +1216,20 @@
       }
       setStructStatus(`${res.counts.nodes} nodes · ${res.counts.edges} edges`, false);
 
-      // Pick an algorithm that matches the shape so tracing is meaningful.
-      const algo = structFormat === 'tree' ? 'bstInsert' : 'dfs';
+      // Pick an algorithm that matches the shape so tracing is meaningful. For
+      // the array format, keep the current algorithm if it already consumes a
+      // flat value list; otherwise default to quicksort.
+      const ARRAY_ALGOS = new Set(['stack', 'queue', 'hashTable', 'heap',
+        'quickSort', 'bubbleSort', 'insertionSort']);
+      let algo;
+      if (structFormat === 'tree') algo = 'bstInsert';
+      else if (structFormat === 'graph') algo = 'dfs';
+      else algo = ARRAY_ALGOS.has(engine.activeAlgorithm) ? engine.activeAlgorithm : 'quickSort';
       engine.setActiveAlgorithm(algo);
       syncAlgoTab(algo);
       renderCode(algo, -1);
       els.algoBadge.textContent = ALGO_LABELS[algo] || algo;
+      updateComplexityBadge(algo);
       syncRecursionMode(algo);
     });
   }
@@ -1154,6 +1296,53 @@
     const d = det3(m);
     els.linalgDet.textContent = `det ${d.toFixed(2)}`;
     els.linalgDet.classList.toggle('is-error', Math.abs(d) < 1e-6);
+  }
+
+  /**
+   * Inverse of a column-major 3×3, or null if singular (|det| ~ 0). Returns a
+   * column-major array so it drops straight into applyMatrix / the cells.
+   */
+  function invert3(m) {
+    const d = det3(m);
+    if (Math.abs(d) < 1e-6) return null;      // singular — no inverse
+    const inv = 1 / d;
+    // Cofactor / adjugate, transposed, in column-major order.
+    const c = [
+      (m[4] * m[8] - m[5] * m[7]) * inv,
+      (m[2] * m[7] - m[1] * m[8]) * inv,
+      (m[1] * m[5] - m[2] * m[4]) * inv,
+      (m[5] * m[6] - m[3] * m[8]) * inv,
+      (m[0] * m[8] - m[2] * m[6]) * inv,
+      (m[2] * m[3] - m[0] * m[5]) * inv,
+      (m[3] * m[7] - m[4] * m[6]) * inv,
+      (m[1] * m[6] - m[0] * m[7]) * inv,
+      (m[0] * m[4] - m[1] * m[3]) * inv,
+    ];
+    return c;
+  }
+
+  /* Undo stack of applied matrices. Each apply pushes the PREVIOUS matrix so
+   * Undo animates back to it. Capped so it can't grow without bound. */
+  const laHistory = [];
+  const LA_HISTORY_MAX = 32;
+
+  function laPushHistory(prevMatrix) {
+    laHistory.push(prevMatrix.slice());
+    if (laHistory.length > LA_HISTORY_MAX) laHistory.shift();
+    updateUndoButton();
+  }
+
+  function updateUndoButton() {
+    if (els.btnUndoMatrix) els.btnUndoMatrix.disabled = laHistory.length === 0;
+  }
+
+  /** Apply a matrix AND record the current one for undo. Central entry point. */
+  function applyMatrixTracked(next) {
+    if (!renderer) return;
+    laPushHistory(readMatrixCells());
+    writeMatrixCells(next);
+    renderer.applyMatrix(next);
+    updateDetBadge(next);
   }
 
   /* -------------------------------------------------------------------------
@@ -1381,6 +1570,24 @@ int main() {
     if (renderer && renderer.setLinearDimension) renderer.setLinearDimension('2d');
   }
 
+  /* Reset snap / eigen / det toggles, speed, and the undo history so each
+   * visit to Grid Transform starts from a clean, predictable state. */
+  function resetLaOptions() {
+    laHistory.length = 0;
+    updateUndoButton();
+    if (els.laSnapToggle) els.laSnapToggle.checked = false;
+    if (els.laEigenToggle) els.laEigenToggle.checked = false;
+    if (els.laDetToggle) els.laDetToggle.checked = false;
+    if (els.laSpeed) { els.laSpeed.value = '2'; }
+    if (els.laSpeedVal) els.laSpeedVal.textContent = '2.0s';
+    if (renderer) {
+      if (renderer.setLaSnap) renderer.setLaSnap(false);
+      if (renderer.setLaEigen) renderer.setLaEigen(false);
+      if (renderer.setLaDet) renderer.setLaDet(false);
+      if (renderer.setLaSpeed) renderer.setLaSpeed(2);
+    }
+  }
+
   function wireLinearAlgebra() {
     // Mode toggle: Data Structure ↔ Grid Transform.
     els.linalgModeTabs.addEventListener('click', (e) => {
@@ -1404,6 +1611,7 @@ int main() {
         renderer.enterLinearMode();
         // Always start in 2D — reset the toggle + hide the vector panel.
         resetLaDimUI();
+        resetLaOptions();
         const m = readMatrixCells();
         renderer.applyMatrix(m);
         updateDetBadge(m);
@@ -1413,6 +1621,7 @@ int main() {
       } else {
         renderer.exitLinearMode();
         resetLaDimUI();
+        resetLaOptions();
         renderer.resumeAutoOrbit();
         setMode('IDLE');
         // Coming out of LA mode, re-enter recursion if a recursive algo is live.
@@ -1422,17 +1631,12 @@ int main() {
 
     els.btnApplyMatrix.addEventListener('click', () => {
       if (!renderer) return;
-      const m = readMatrixCells();
-      renderer.applyMatrix(m);
-      updateDetBadge(m);
+      applyMatrixTracked(readMatrixCells());
     });
 
     els.btnResetMatrix.addEventListener('click', () => {
       if (!renderer) return;
-      const I = [1, 0, 0, 0, 1, 0, 0, 0, 1];
-      writeMatrixCells(I);
-      renderer.applyMatrix(I);
-      updateDetBadge(I);
+      applyMatrixTracked([1, 0, 0, 0, 1, 0, 0, 0, 1]);
     });
 
     // Live determinant readout as the user edits cells.
@@ -1444,9 +1648,51 @@ int main() {
       if (!btn || !renderer) return;
       const preset = LA_PRESETS[btn.getAttribute('data-preset')];
       if (!preset) return;
-      writeMatrixCells(preset);
-      renderer.applyMatrix(preset);
-      updateDetBadge(preset);
+      applyMatrixTracked(preset.slice());
+    });
+
+    // Inverse: animate to M⁻¹, or flash the det badge if singular (no inverse).
+    els.btnInvertMatrix.addEventListener('click', () => {
+      if (!renderer) return;
+      const inv = invert3(readMatrixCells());
+      if (!inv) {
+        els.linalgDet.classList.add('is-error');
+        els.hudDesc.textContent = 'Matrix is singular (det 0) — no inverse exists.';
+        return;
+      }
+      applyMatrixTracked(inv);
+    });
+
+    // Undo: animate back to the previously applied matrix.
+    els.btnUndoMatrix.addEventListener('click', () => {
+      if (!renderer || laHistory.length === 0) return;
+      const prev = laHistory.pop();
+      writeMatrixCells(prev);
+      renderer.applyMatrix(prev);
+      updateDetBadge(prev);
+      updateUndoButton();
+    });
+
+    // Snap-to-integer while dragging basis tips.
+    els.laSnapToggle.addEventListener('change', () => {
+      if (renderer) renderer.setLaSnap(els.laSnapToggle.checked);
+    });
+
+    // Eigenvector overlay toggle.
+    els.laEigenToggle.addEventListener('change', () => {
+      if (renderer) renderer.setLaEigen(els.laEigenToggle.checked);
+    });
+
+    // Determinant area/volume shading toggle.
+    els.laDetToggle.addEventListener('change', () => {
+      if (renderer) renderer.setLaDet(els.laDetToggle.checked);
+    });
+
+    // Animation speed slider (seconds per transition).
+    els.laSpeed.addEventListener('input', () => {
+      const s = parseFloat(els.laSpeed.value);
+      if (renderer) renderer.setLaSpeed(s);
+      els.laSpeedVal.textContent = s.toFixed(1) + 's';
     });
 
     // 2D / 3D toggle: switch the renderer's coordinate stage + reveal vector UI.
@@ -1487,6 +1733,34 @@ int main() {
   }
 
   /* =========================================================================
+   * Playback & Insight wiring — speed slider + timeline scrubber.
+   * ====================================================================== */
+  function wireInsight() {
+    // Playback speed: update the interval; restart the timer if mid-play.
+    els.playSpeed.addEventListener('input', () => {
+      execSpeedMs = parseInt(els.playSpeed.value, 10) || 900;
+      els.playSpeedVal.textContent = (execSpeedMs / 1000).toFixed(1) + 's';
+      restartPlaybackTimer();
+    });
+
+    // Timeline scrubber: jump to a step. Scrubbing pauses auto-play so the user
+    // stays in control of the position.
+    els.stepScrubber.addEventListener('input', () => {
+      stopExecute();
+      const i = parseInt(els.stepScrubber.value, 10) || 0;
+      // If no trace is built yet, build one first so there's something to scrub.
+      if (engine.algorithmHistory.length === 0) {
+        if (!buildTrace()) return;
+      }
+      engine.jumpTo(i);
+    });
+
+    // Step nudge buttons flanking the scrubber.
+    els.btnScrubBack.addEventListener('click', () => { stopExecute(); stepBackward(); });
+    els.btnScrubFwd.addEventListener('click', () => { stopExecute(); stepForward(); });
+  }
+
+  /* =========================================================================
    * Demo data — seeds a structure appropriate to the active algorithm.
    * ====================================================================== */
   function seedDemoData() {
@@ -1511,8 +1785,26 @@ int main() {
         const angle = i * 1.1;
         engine.addNode(v, { x: Math.cos(angle) * 7, y: Math.sin(angle) * 4, z: 0 });
       });
+    } else if (algo === 'stack' || algo === 'queue' ||
+               algo === 'hashTable' || algo === 'heap' ||
+               algo === 'quickSort' || algo === 'bubbleSort' ||
+               algo === 'insertionSort') {
+      // Synthesized structures read a flat value list (the builder lays them
+      // out). Seed a row of plain value nodes as the input array.
+      const demo = {
+        stack: [3, 7, 1, 9],
+        queue: [3, 7, 1, 9],
+        hashTable: [15, 22, 8, 29, 1],
+        heap: [5, 3, 8, 1, 9, 2],
+        quickSort: [5, 2, 8, 1, 9, 3, 7],
+        bubbleSort: [5, 2, 8, 1, 9, 3],
+        insertionSort: [5, 2, 8, 1, 9, 3],
+      }[algo];
+      demo.forEach((v, i) =>
+        engine.addNode(v, { x: -((demo.length - 1) * 1.6) / 2 + i * 1.6, y: 0, z: 0 })
+      );
     } else {
-      // Graph algorithms (DFS / Dijkstra): a small weighted graph.
+      // Graph algorithms (DFS / BFS / Dijkstra): a small weighted graph.
       const vals = [1, 2, 3, 4, 5];
       const nodes = vals.map((v, i) => {
         const angle = (i / vals.length) * Math.PI * 2;
@@ -1537,6 +1829,7 @@ int main() {
     wireLinearAlgebra();
     wireRecursion();
     wireSandbox();
+    wireInsight();
 
     // 1. 3D engine (required). Fail loudly if THREE / Renderer3D missing.
     if (!window.Render3D) {
@@ -1554,6 +1847,7 @@ int main() {
 
     // Render the initial (empty) code panel.
     renderCode(engine.activeAlgorithm, -1);
+    updateComplexityBadge(engine.activeAlgorithm);
 
     // 2. Speech (optional). Never blocks the lab.
     try {

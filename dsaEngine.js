@@ -227,6 +227,88 @@ const CPP_SOURCES = {
     '            dfs(v);            // recurse into neighbor',
     '}',
   ],
+
+  stack: [
+    'stack<int> st;',
+    'st.push(x);        // push onto the top',
+    'int top = st.top();// peek the top',
+    'st.pop();          // remove the top (LIFO)',
+    'bool e = st.empty();',
+  ],
+
+  queue: [
+    'queue<int> q;',
+    'q.push(x);         // enqueue at the back',
+    'int f = q.front(); // peek the front',
+    'q.pop();           // dequeue the front (FIFO)',
+    'bool e = q.empty();',
+  ],
+
+  hashTable: [
+    'int h = key % SIZE;          // hash to a bucket',
+    'for (Node* p : bucket[h])    // walk the chain',
+    '    if (p->key == key) return;',
+    'bucket[h].push_back(key);    // insert (chaining)',
+  ],
+
+  heap: [
+    'void push(int x) {',
+    '    a.push_back(x);          // add at the end',
+    '    int i = a.size() - 1;',
+    '    while (i > 0 && a[(i-1)/2] > a[i]) {',
+    '        swap(a[i], a[(i-1)/2]);   // sift up',
+    '        i = (i - 1) / 2;',
+    '    }',
+    '}',
+  ],
+
+  quickSort: [
+    'void quickSort(vector<int>& a, int lo, int hi) {',
+    '    if (lo >= hi) return;',
+    '    int pivot = a[hi], i = lo;',
+    '    for (int j = lo; j < hi; j++)',
+    '        if (a[j] < pivot)',
+    '            swap(a[i++], a[j]);',
+    '    swap(a[i], a[hi]);        // place pivot',
+    '    quickSort(a, lo, i - 1);',
+    '    quickSort(a, i + 1, hi);',
+    '}',
+  ],
+
+  bubbleSort: [
+    'void bubbleSort(vector<int>& a) {',
+    '    for (int i = 0; i < n - 1; i++)',
+    '        for (int j = 0; j < n-1-i; j++)',
+    '            if (a[j] > a[j+1])',
+    '                swap(a[j], a[j+1]);',
+    '}',
+  ],
+
+  insertionSort: [
+    'void insertionSort(vector<int>& a) {',
+    '    for (int i = 1; i < n; i++) {',
+    '        int key = a[i], j = i - 1;',
+    '        while (j >= 0 && a[j] > key)',
+    '            a[j+1] = a[j--];      // shift right',
+    '        a[j+1] = key;             // drop key in',
+    '    }',
+    '}',
+  ],
+
+  bfs: [
+    'void bfs(int start) {',
+    '    queue<int> q; q.push(start);',
+    '    visited[start] = true;',
+    '    while (!q.empty()) {',
+    '        int u = q.front(); q.pop();',
+    '        for (int v : adj[u])',
+    '            if (!visited[v]) {',
+    '                visited[v] = true;',
+    '                q.push(v);',
+    '            }',
+    '    }',
+    '}',
+  ],
 };
 
 /* ===========================================================================
@@ -392,6 +474,8 @@ class DSAEngine {
         parsed = this._parseTreeArray(text);
       } else if (format === 'graph') {
         parsed = this._parseEdgeList(text);
+      } else if (format === 'array') {
+        parsed = this._parseValueArray(text);
       } else {
         return { ok: false, error: `Unknown format "${format}".` };
       }
@@ -411,6 +495,26 @@ class DSAEngine {
       ok: true,
       counts: { nodes: parsed.nodes.length, edges: parsed.edges.length },
     };
+  }
+
+  /**
+   * Parse a flat value array like "5, 2, 8, 1" (brackets optional) into a row of
+   * plain value nodes — the input for synthesized structures (sorting / stack /
+   * queue / heap / hash). Their builders read node values via _seedValues and
+   * lay the structure out themselves.
+   */
+  _parseValueArray(text) {
+    const nums = this._tokenizeArray(text).filter((v) => v !== null && Number.isFinite(v));
+    if (nums.length === 0) return { nodes: [], edges: [] };
+    const DX = 1.9;
+    const x0 = -((nums.length - 1) * DX) / 2;
+    const nodes = nums.map((v, i) => ({
+      uuid: generateUUID(),
+      value: v,
+      position: { x: x0 + i * DX, y: 0, z: 0 },
+      state: 'default',
+    }));
+    return { nodes, edges: [] };
   }
 
   /**
@@ -725,6 +829,8 @@ class DSAEngine {
         description: step.description,
         algorithm: step.algorithm,
         frame: step.frame || null,
+        stats: step.stats || null,
+        vars: step.vars || null,
         stepIndex: this.historyIndex,
         stepCount: this.algorithmHistory.length,
         playing: true,
@@ -736,6 +842,8 @@ class DSAEngine {
       description: 'Live editing — spawn and connect nodes in mid-air.',
       algorithm: this.activeAlgorithm,
       frame: null,
+      stats: null,
+      vars: null,
       stepIndex: -1,
       stepCount: this.algorithmHistory.length,
       playing: false,
@@ -746,7 +854,7 @@ class DSAEngine {
    * Push one immutable snapshot onto the history. This is the ONLY place a
    * step is recorded, guaranteeing every step is a deep clone.
    */
-  _record(model, lineIndex, description, algorithm, frame = null) {
+  _record(model, lineIndex, description, algorithm, frame = null, vars = null) {
     this.algorithmHistory.push({
       model: deepClone(model),
       lineIndex,
@@ -757,6 +865,11 @@ class DSAEngine {
       // recursive algorithms simply omit it, so it defaults to null and the
       // renderer's recursion layer stays dormant.
       frame: frame ? deepClone(frame) : null,
+      // Operation counters snapshot (comparisons/swaps/visits) at this step, and
+      // an optional variable/pointer list for the inspector. Both additive &
+      // optional — algorithms that don't set them simply record nulls.
+      stats: this._stats ? { ...this._stats } : null,
+      vars: vars ? vars.map((v) => ({ name: v.name, value: v.value })) : null,
     });
   }
 
@@ -769,6 +882,16 @@ class DSAEngine {
       return true;
     }
     return false;
+  }
+
+  /** Jump directly to step index `i` (clamped). Used by the timeline scrubber. */
+  jumpTo(i) {
+    if (this.algorithmHistory.length === 0) return false;
+    const clamped = Math.max(0, Math.min(this.algorithmHistory.length - 1, i | 0));
+    if (clamped === this.historyIndex) return false;
+    this.historyIndex = clamped;
+    this._emit();
+    return true;
   }
 
   /** Pop back one step — a lossless restore of an earlier moment. */
@@ -807,6 +930,9 @@ class DSAEngine {
    */
   buildTrace() {
     this._resetTrace();
+    // Fresh operation counters for this trace (comparisons/swaps/visits). Builders
+    // bump these; _record snapshots them per step so scrubbing shows the tally.
+    this._stats = { comparisons: 0, swaps: 0, visits: 0 };
     switch (this.activeAlgorithm) {
       case 'linkedListReversal':
         this._traceLinkedListReversal();
@@ -833,6 +959,30 @@ class DSAEngine {
         break;
       case 'dfsRecursive':
         this._traceDFSRecursive();
+        break;
+      case 'stack':
+        this._traceStack();
+        break;
+      case 'queue':
+        this._traceQueue();
+        break;
+      case 'hashTable':
+        this._traceHashTable();
+        break;
+      case 'heap':
+        this._traceHeap();
+        break;
+      case 'quickSort':
+        this._traceQuickSort();
+        break;
+      case 'bubbleSort':
+        this._traceBubbleSort();
+        break;
+      case 'insertionSort':
+        this._traceInsertionSort();
+        break;
+      case 'bfs':
+        this._traceBFS();
         break;
       default:
         console.warn('[dsaEngine] no trace builder for', this.activeAlgorithm);
@@ -1752,8 +1902,482 @@ class DSAEngine {
     dfs(start);
   }
 
-  /* ===================================================================== */
-  /* CUSTOM C++ SANDBOX authoring API                                      */
+  /* --------------------------------------------------------------------- */
+  /* Helpers for synthesized structures (stack/queue/hash/heap/sorting).   */
+  /* These build their OWN node models (values + explicit positions) rather */
+  /* than reading the hand-built graph, so setModel places them directly.  */
+  /* --------------------------------------------------------------------- */
+
+  /**
+   * Seed values for a synthesized structure. Prefer the live model's node values
+   * (so "Demo Data" / custom array input flows through), else use `fallback`.
+   */
+  _seedValues(fallback) {
+    if (this.model.nodes.length) {
+      return this.model.nodes.map((n) => Math.round(Number(n.value) || 0));
+    }
+    return fallback.slice();
+  }
+
+  _mkNode(value, x, y, z, state, shape, meta) {
+    return {
+      uuid: generateUUID(),
+      value,
+      position: { x, y, z: z || 0 },
+      state: state || 'default',
+      shape: shape || 'sphere',
+      meta: meta || null,
+    };
+  }
+
+  /* ALGORITHM — Stack (LIFO tower of glass blocks) --------------------- */
+  _traceStack() {
+    const ALGO = 'stack';
+    const vals = this._seedValues([3, 7, 1, 9]);
+    const BX = -2;                      // x column for the tower
+    const yOf = (i) => -4 + i * 1.9;    // stack grows upward
+    const model = { nodes: [], edges: [] };
+    const cells = [];                   // parallel to the logical stack
+
+    this._record(model, 0, 'Create an empty stack (LIFO).', ALGO);
+
+    // Push phase.
+    for (let i = 0; i < vals.length; i++) {
+      const node = this._mkNode(vals[i], BX, yOf(i), 0, 'added', 'block');
+      cells.push(node);
+      model.nodes = cells.map((c) => c);
+      this._stats.visits++;
+      this._record(model, 1, `push(${vals[i]}) → top of stack`, ALGO,
+        null, [{ name: 'top', value: vals[i] }, { name: 'size', value: cells.length }]);
+      node.state = 'default';
+    }
+
+    // Peek the top.
+    if (cells.length) {
+      cells[cells.length - 1].state = 'active';
+      this._record(model, 2, `top() = ${cells[cells.length - 1].value}`, ALGO,
+        null, [{ name: 'top', value: cells[cells.length - 1].value }]);
+      cells[cells.length - 1].state = 'default';
+    }
+
+    // Pop phase — remove two from the top.
+    const popCount = Math.min(2, cells.length);
+    for (let k = 0; k < popCount; k++) {
+      const top = cells[cells.length - 1];
+      top.state = 'removed';
+      this._record(model, 3, `pop() → remove ${top.value} (top)`, ALGO,
+        null, [{ name: 'popped', value: top.value }, { name: 'size', value: cells.length - 1 }]);
+      cells.pop();
+      model.nodes = cells.map((c) => c);
+      this._stats.visits++;
+      this._record(model, 3, `Stack now has ${cells.length} element(s).`, ALGO,
+        null, [{ name: 'size', value: cells.length }]);
+    }
+
+    this._record(model, 4, `empty() = ${cells.length === 0}`, ALGO,
+      null, [{ name: 'empty', value: cells.length === 0 }]);
+  }
+
+  /* ALGORITHM — Queue (FIFO row of glass blocks) ---------------------- */
+  _traceQueue() {
+    const ALGO = 'queue';
+    const vals = this._seedValues([3, 7, 1, 9]);
+    const yQ = 0;
+    const xOf = (i) => -6 + i * 2.6;    // front on the left, grows right
+    const model = { nodes: [], edges: [] };
+    const cells = [];
+
+    this._record(model, 0, 'Create an empty queue (FIFO).', ALGO);
+
+    // Enqueue phase.
+    for (let i = 0; i < vals.length; i++) {
+      const node = this._mkNode(vals[i], xOf(cells.length), yQ, 0, 'added', 'block');
+      cells.push(node);
+      model.nodes = cells.map((c) => c);
+      this._stats.visits++;
+      this._record(model, 1, `push(${vals[i]}) → enqueue at back`, ALGO,
+        null, [{ name: 'back', value: vals[i] }, { name: 'size', value: cells.length }]);
+      node.state = 'default';
+    }
+
+    // Peek the front.
+    if (cells.length) {
+      cells[0].state = 'active';
+      this._record(model, 2, `front() = ${cells[0].value}`, ALGO,
+        null, [{ name: 'front', value: cells[0].value }]);
+      cells[0].state = 'default';
+    }
+
+    // Dequeue phase — remove two from the front; survivors slide left.
+    const deqCount = Math.min(2, cells.length);
+    for (let k = 0; k < deqCount; k++) {
+      const front = cells[0];
+      front.state = 'removed';
+      this._record(model, 3, `pop() → dequeue ${front.value} (front)`, ALGO,
+        null, [{ name: 'dequeued', value: front.value }, { name: 'size', value: cells.length - 1 }]);
+      cells.shift();
+      // Slide remaining toward the front so the row stays left-anchored.
+      cells.forEach((c, idx) => { c.position.x = xOf(idx); });
+      model.nodes = cells.map((c) => c);
+      this._stats.visits++;
+      this._record(model, 3, `Queue now has ${cells.length} element(s).`, ALGO,
+        null, [{ name: 'size', value: cells.length }]);
+    }
+
+    this._record(model, 4, `empty() = ${cells.length === 0}`, ALGO,
+      null, [{ name: 'empty', value: cells.length === 0 }]);
+  }
+
+  /* ALGORITHM — Hash table (chaining, key % SIZE) --------------------- */
+  _traceHashTable() {
+    const ALGO = 'hashTable';
+    const SIZE = 7;
+    const keys = this._seedValues([15, 22, 8, 29, 1]);
+    const bucketY = (b) => 5 - b * 1.7;   // buckets stacked top→down on the left
+    const BUCKET_X = -7;
+    const model = { nodes: [], edges: [] };
+
+    // Build the bucket trays first (fixed neutral frames with an index label).
+    const buckets = [];
+    for (let b = 0; b < SIZE; b++) {
+      const tray = this._mkNode(b, BUCKET_X, bucketY(b), 0, 'default', 'bucket', { bucket: b });
+      buckets.push(tray);
+      model.nodes.push(tray);
+    }
+    // chains[b] = array of entry nodes hanging off bucket b.
+    const chains = Array.from({ length: SIZE }, () => []);
+    this._record(model, 0, `Empty hash table with ${SIZE} buckets (chaining).`, ALGO);
+
+    for (const key of keys) {
+      const h = ((key % SIZE) + SIZE) % SIZE;
+      buckets[h].state = 'active';
+      this._stats.comparisons++;
+      this._record(model, 0, `hash(${key}) = ${key} % ${SIZE} = ${h}`, ALGO,
+        null, [{ name: 'key', value: key }, { name: 'bucket', value: h }]);
+
+      // Walk the existing chain (collision probing).
+      for (let i = 0; i < chains[h].length; i++) {
+        chains[h][i].state = 'compare';
+        this._stats.comparisons++;
+        this._record(model, 1, `Probe chain[${h}] slot ${i} → ${chains[h][i].value}`, ALGO,
+          null, [{ name: 'key', value: key }, { name: 'bucket', value: h }]);
+        chains[h][i].state = 'added';
+      }
+
+      // Insert at the tail of the chain (spheres in a row to the right).
+      const entry = this._mkNode(
+        key, BUCKET_X + 2.4 + chains[h].length * 2.0, bucketY(h), 0, 'active', 'sphere');
+      chains[h].push(entry);
+      model.nodes.push(entry);
+      const prev = chains[h].length === 1 ? buckets[h] : chains[h][chains[h].length - 2];
+      model.edges.push({
+        uuid: generateUUID(), from: prev.uuid, to: entry.uuid,
+        directed: true, weight: 1, state: 'path',
+      });
+      this._stats.visits++;
+      this._record(model, 3, `Insert ${key} into bucket ${h} (chain length ${chains[h].length}).`, ALGO,
+        null, [{ name: 'key', value: key }, { name: 'bucket', value: h }, { name: 'collision', value: chains[h].length > 1 }]);
+      entry.state = 'added';
+      buckets[h].state = 'default';
+      model.edges.forEach((e) => { e.state = 'default'; });
+    }
+
+    this._record(model, 3, `Done — ${keys.length} keys placed by chaining.`, ALGO);
+  }
+
+  /* ALGORITHM — Min-heap insert with sift-up (tree + array strip) ----- */
+  _traceHeap() {
+    const ALGO = 'heap';
+    const keys = this._seedValues([5, 3, 8, 1, 9, 2]);
+    const model = { nodes: [], edges: [] };
+    const heap = [];        // logical array of values
+    const treeNodes = [];   // parallel tree sphere-nodes
+    const stripNodes = [];  // parallel array-strip block-nodes
+
+    const STRIP_Y = -8, STRIP_X0 = -7, STRIP_DX = 1.7;
+    const treePos = (i) => {
+      const d = Math.floor(Math.log2(i + 1));
+      const firstInRow = Math.pow(2, d) - 1;
+      const col = i - firstInRow;
+      const rowCount = Math.pow(2, d);
+      const slot = 8 * Math.pow(2, 2 - d);
+      return { x: (col - (rowCount - 1) / 2) * slot, y: 5 - d * 2.6 };
+    };
+    const rebuildPositions = () => {
+      treeNodes.forEach((n, i) => { const p = treePos(i); n.position.x = p.x; n.position.y = p.y; });
+      stripNodes.forEach((n, i) => { n.position.x = STRIP_X0 + i * STRIP_DX; n.position.y = STRIP_Y; });
+    };
+    const syncModel = () => { model.nodes = [...treeNodes, ...stripNodes]; };
+    const relinkEdges = () => {
+      model.edges = [];
+      for (let i = 1; i < treeNodes.length; i++) {
+        const parent = (i - 1) >> 1;
+        model.edges.push({
+          uuid: generateUUID(), from: treeNodes[parent].uuid, to: treeNodes[i].uuid,
+          directed: false, weight: 1, state: 'default',
+        });
+      }
+    };
+
+    this._record(model, 0, 'Build a min-heap by inserting + sifting up.', ALGO);
+
+    for (const key of keys) {
+      heap.push(key);
+      const idx = heap.length - 1;
+      const tn = this._mkNode(key, 0, 0, 0, 'added', 'sphere');
+      const sn = this._mkNode(key, 0, STRIP_Y, 0, 'added', 'block', { slot: idx });
+      treeNodes.push(tn); stripNodes.push(sn);
+      rebuildPositions(); relinkEdges(); syncModel();
+      this._stats.visits++;
+      this._record(model, 1, `push(${key}) at index ${idx}`, ALGO,
+        null, [{ name: 'inserted', value: key }, { name: 'index', value: idx }]);
+      tn.state = 'default'; sn.state = 'default';
+
+      // Sift up while the parent is larger (min-heap).
+      let i = idx;
+      while (i > 0) {
+        const parent = (i - 1) >> 1;
+        treeNodes[i].state = 'active'; treeNodes[parent].state = 'compare';
+        stripNodes[i].state = 'active'; stripNodes[parent].state = 'compare';
+        this._stats.comparisons++;
+        this._record(model, 3, `Compare ${heap[i]} with parent ${heap[parent]}`, ALGO,
+          null, [{ name: 'i', value: i }, { name: 'parent', value: parent }]);
+        if (heap[parent] <= heap[i]) {
+          treeNodes[i].state = 'default'; treeNodes[parent].state = 'default';
+          stripNodes[i].state = 'default'; stripNodes[parent].state = 'default';
+          break;
+        }
+        [heap[i], heap[parent]] = [heap[parent], heap[i]];
+        const swapVal = (arr) => { arr[i].value = heap[i]; arr[parent].value = heap[parent]; };
+        swapVal(treeNodes); swapVal(stripNodes);
+        this._stats.swaps++;
+        this._record(model, 4, `Swap ${heap[parent]} ↕ ${heap[i]} (child < parent)`, ALGO,
+          null, [{ name: 'i', value: i }, { name: 'parent', value: parent }]);
+        treeNodes[i].state = 'default'; stripNodes[i].state = 'default';
+        i = parent;
+      }
+      treeNodes.forEach((n) => { n.state = 'default'; });
+      stripNodes.forEach((n) => { n.state = 'default'; });
+    }
+
+    this._record(model, 7, `Min-heap complete — root = ${heap[0]} (minimum).`, ALGO,
+      null, [{ name: 'root', value: heap[0] }, { name: 'size', value: heap.length }]);
+  }
+
+  /* --------------------------------------------------------------------- */
+  /* SORTING — shared bar helpers. Each bar node carries meta.height so the */
+  /* renderer scales it; value + height move together on every swap so the  */
+  /* bar chart animates the sort.                                           */
+  /* --------------------------------------------------------------------- */
+
+  /** Build a row of bar nodes from `vals`; returns the node array (index order). */
+  _buildBars(vals) {
+    const n = vals.length;
+    const DX = 1.9;
+    const x0 = -((n - 1) * DX) / 2;
+    return vals.map((v, i) =>
+      this._mkNode(v, x0 + i * DX, 0, 0, 'default', 'bar', { height: Math.max(0.6, v * 0.8) })
+    );
+  }
+
+  /** Swap two bar nodes' value + height + label so a swap animates in place. */
+  _swapBars(bars, i, j) {
+    const a = bars[i], b = bars[j];
+    const av = a.value, ah = a.meta.height;
+    a.value = b.value; a.meta = { ...a.meta, height: b.meta.height };
+    b.value = av; b.meta = { ...b.meta, height: ah };
+  }
+
+  /* ALGORITHM — Quicksort (iterative Lomuto, flat trace on bars) ------ */
+  _traceQuickSort() {
+    const ALGO = 'quickSort';
+    const vals = this._seedValues([5, 2, 8, 1, 9, 3, 7]);
+    const bars = this._buildBars(vals);
+    const model = { nodes: bars, edges: [] };
+    const clearStates = () => bars.forEach((b) => { if (b.state !== 'path') b.state = 'default'; });
+
+    this._record(model, 0, 'Quicksort (Lomuto partition, iterative).', ALGO);
+
+    // Explicit stack of [lo,hi] ranges — keeps the trace flat (no call tree).
+    const work = [[0, bars.length - 1]];
+    while (work.length) {
+      const [lo, hi] = work.pop();
+      if (lo >= hi) {
+        if (lo === hi) bars[lo].state = 'path';
+        this._record(model, 1, `Range [${lo},${hi}] size ≤ 1 → sorted.`, ALGO);
+        continue;
+      }
+      clearStates();
+      const pivotVal = bars[hi].value;
+      bars[hi].state = 'active';
+      this._record(model, 2, `Pivot = ${pivotVal} (index ${hi}).`, ALGO,
+        null, [{ name: 'lo', value: lo }, { name: 'hi', value: hi }, { name: 'pivot', value: pivotVal }]);
+
+      let i = lo;
+      for (let j = lo; j < hi; j++) {
+        bars[j].state = bars[j].state === 'path' ? 'path' : 'compare';
+        this._stats.comparisons++;
+        this._record(model, 4, `Compare ${bars[j].value} < pivot ${pivotVal}?`, ALGO,
+          null, [{ name: 'i', value: i }, { name: 'j', value: j }, { name: 'pivot', value: pivotVal }]);
+        if (bars[j].value < pivotVal) {
+          if (i !== j) {
+            this._swapBars(bars, i, j);
+            this._stats.swaps++;
+            this._record(model, 5, `${bars[i].value} < pivot → swap into position ${i}.`, ALGO,
+              null, [{ name: 'i', value: i }, { name: 'j', value: j }]);
+          }
+          i++;
+        }
+        if (bars[j].state !== 'path') bars[j].state = 'default';
+      }
+      // Place the pivot at its final index i.
+      if (i !== hi) { this._swapBars(bars, i, hi); this._stats.swaps++; }
+      bars[i].state = 'path';
+      bars[hi].state = bars[hi].state === 'path' ? 'path' : 'default';
+      this._record(model, 6, `Pivot ${pivotVal} settled at index ${i}.`, ALGO,
+        null, [{ name: 'pivot', value: pivotVal }, { name: 'final', value: i }]);
+      // Recurse on the two sides (push larger first is unnecessary here).
+      work.push([lo, i - 1]);
+      work.push([i + 1, hi]);
+    }
+
+    bars.forEach((b) => (b.state = 'path'));
+    this._record(model, 0, 'Array is sorted.', ALGO);
+  }
+
+  /* ALGORITHM — Bubble sort (adjacent compare + swap) ----------------- */
+  _traceBubbleSort() {
+    const ALGO = 'bubbleSort';
+    const vals = this._seedValues([5, 2, 8, 1, 9, 3]);
+    const bars = this._buildBars(vals);
+    const model = { nodes: bars, edges: [] };
+    const n = bars.length;
+
+    this._record(model, 0, 'Bubble sort — bubble the largest to the end each pass.', ALGO);
+
+    for (let i = 0; i < n - 1; i++) {
+      for (let j = 0; j < n - 1 - i; j++) {
+        bars[j].state = 'compare'; bars[j + 1].state = 'compare';
+        this._stats.comparisons++;
+        this._record(model, 3, `Compare ${bars[j].value} and ${bars[j + 1].value}`, ALGO,
+          null, [{ name: 'i', value: i }, { name: 'j', value: j }]);
+        if (bars[j].value > bars[j + 1].value) {
+          this._swapBars(bars, j, j + 1);
+          this._stats.swaps++;
+          this._record(model, 4, `Out of order → swap.`, ALGO,
+            null, [{ name: 'j', value: j }]);
+        }
+        if (bars[j].state !== 'path') bars[j].state = 'default';
+        if (bars[j + 1].state !== 'path') bars[j + 1].state = 'default';
+      }
+      // The last unsorted element is now in place.
+      bars[n - 1 - i].state = 'path';
+      this._record(model, 2, `${bars[n - 1 - i].value} is in its final position.`, ALGO);
+    }
+    bars.forEach((b) => (b.state = 'path'));
+    this._record(model, 0, 'Array is sorted.', ALGO);
+  }
+
+  /* ALGORITHM — Insertion sort (shift + insert the key) --------------- */
+  _traceInsertionSort() {
+    const ALGO = 'insertionSort';
+    const vals = this._seedValues([5, 2, 8, 1, 9, 3]);
+    const bars = this._buildBars(vals);
+    const model = { nodes: bars, edges: [] };
+    const n = bars.length;
+
+    bars[0].state = 'path';
+    this._record(model, 0, 'Insertion sort — grow a sorted prefix.', ALGO);
+
+    for (let i = 1; i < n; i++) {
+      const keyVal = bars[i].value, keyH = bars[i].meta.height;
+      bars[i].state = 'active';
+      this._record(model, 2, `Take key = ${keyVal} (index ${i}).`, ALGO,
+        null, [{ name: 'i', value: i }, { name: 'key', value: keyVal }]);
+      let j = i - 1;
+      while (j >= 0 && bars[j].value > keyVal) {
+        bars[j].state = 'compare';
+        this._stats.comparisons++;
+        this._record(model, 3, `${bars[j].value} > key ${keyVal} → shift right.`, ALGO,
+          null, [{ name: 'j', value: j }, { name: 'key', value: keyVal }]);
+        // Shift bar j into j+1.
+        bars[j + 1].value = bars[j].value;
+        bars[j + 1].meta = { ...bars[j + 1].meta, height: bars[j].meta.height };
+        this._stats.swaps++;
+        bars[j].state = 'path';
+        j--;
+      }
+      // Drop the key into the gap.
+      bars[j + 1].value = keyVal;
+      bars[j + 1].meta = { ...bars[j + 1].meta, height: keyH };
+      for (let k = 0; k <= i; k++) bars[k].state = 'path';
+      this._record(model, 5, `Insert key ${keyVal} at index ${j + 1}.`, ALGO,
+        null, [{ name: 'key', value: keyVal }, { name: 'at', value: j + 1 }]);
+    }
+    bars.forEach((b) => (b.state = 'path'));
+    this._record(model, 0, 'Array is sorted.', ALGO);
+  }
+
+  /* ALGORITHM — BFS (queue-driven level-order graph traversal) -------- */
+  _traceBFS() {
+    const ALGO = 'bfs';
+    const model = this._workingModel();
+    if (model.nodes.length === 0) return;
+
+    const graph = this._buildGraphFromModel(model);
+    const start = model.nodes[0].uuid;
+
+    this._setAllNodeStates(model, 'default');
+    this._setAllEdgeStates(model, 'default');
+    this._record(model, 0, 'Breadth-first search using a FIFO queue.', ALGO);
+
+    const visited = new Set([start]);
+    const queue = [start];
+    const startNode = this._findNode(model, start);
+    if (startNode) startNode.state = 'compare';   // enqueued (frontier)
+    this._stats.visits++;
+    this._record(model, 2, `Enqueue start ${startNode?.value}; mark visited.`, ALGO,
+      null, [{ name: 'queue', value: `[${startNode?.value}]` }]);
+
+    while (queue.length) {
+      this._record(model, 3, `Queue: [${queue
+        .map((u) => this._findNode(model, u)?.value).join(', ')}]`, ALGO,
+        null, [{ name: 'size', value: queue.length }]);
+
+      const u = queue.shift();
+      const uNode = this._findNode(model, u);
+      if (uNode) uNode.state = 'active';           // dequeued / processing
+      this._record(model, 4, `Dequeue ${uNode?.value} (front).`, ALGO,
+        null, [{ name: 'u', value: uNode?.value }]);
+
+      const nbrs = graph.neighbors(u);
+      for (let i = 0; i < nbrs.length; i++) {
+        const v = nbrs[i].to;
+        const vNode = this._findNode(model, v);
+        const edge = model.edges.find(
+          (e) => (e.from === u && e.to === v) || (e.from === v && e.to === u));
+        this._stats.comparisons++;
+        this._record(model, 5, `Look at neighbor ${vNode?.value}.`, ALGO);
+        if (!visited.has(v)) {
+          visited.add(v);
+          if (edge) edge.state = 'path';
+          if (vNode) vNode.state = 'compare';       // newly enqueued frontier
+          queue.push(v);
+          this._stats.visits++;
+          this._record(model, 8, `Enqueue ${vNode?.value}; mark visited.`, ALGO,
+            null, [{ name: 'queue', value: `[${queue.map((x) => this._findNode(model, x)?.value).join(', ')}]` }]);
+        } else {
+          this._record(model, 6, `${vNode?.value} already visited → skip.`, ALGO);
+        }
+      }
+      if (uNode) uNode.state = 'visited';
+      this._record(model, 3, `Finished ${uNode?.value}.`, ALGO);
+    }
+
+    this._record(model, 0, 'BFS complete — all reachable nodes visited.', ALGO);
+  }
+
+
   /* ---------------------------------------------------------------------
    * sandbox.js runs the user's C++ through JSCPP and streams `@VIS:` commands
    * here. Unlike the built-in algorithms (which build their whole trace in one

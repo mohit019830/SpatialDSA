@@ -211,6 +211,38 @@
       }),
     };
 
+    // --- DS structure shapes (stack/queue blocks, sorting bars, hash buckets) --
+    // These let the SAME setModel/pooling path render non-sphere structures. Each
+    // uses the per-STATE_COLORS material tables so state coloring is free.
+    //
+    // Glass block (stack + queue cells) — solid glassy slab reusing the glass
+    // material family but with its OWN opacity so a row/column reads clearly.
+    SHARED.dsBlockGeo = new THREE.BoxGeometry(2.2, 1.7, 1.7);
+    // Sorting bar — a UNIT box centered so we can scale on Y and re-anchor the
+    // base to y=0 by shifting up half the scaled height (done per-frame in code).
+    SHARED.barGeo = new THREE.BoxGeometry(1.4, 1, 1.4);
+    // Hash bucket tray — a wide, shallow open frame the chained entries sit in.
+    SHARED.bucketGeo = new THREE.BoxGeometry(2.6, 0.5, 2.0);
+
+    // Per-state solid materials for blocks/bars/buckets. Lambert (lit) like the
+    // node material so lighting is consistent; brighter emissive on focus states.
+    SHARED.dsSolidMat = {};
+    for (const state of Object.keys(STATE_COLORS)) {
+      const color = STATE_COLORS[state];
+      SHARED.dsSolidMat[state] = new THREE.MeshLambertMaterial({
+        color,
+        emissive: color,
+        emissiveIntensity: state === 'active' || state === 'compare' ? 0.85 : 0.35,
+        transparent: true,
+        opacity: 0.82,
+      });
+    }
+    // Dim tray material for hash buckets (a fixed neutral frame, state-agnostic).
+    SHARED.bucketMat = new THREE.MeshLambertMaterial({
+      color: 0x1b3a44, emissive: 0x0d2129, emissiveIntensity: 0.3,
+      transparent: true, opacity: 0.5,
+    });
+
     SHARED.ready = true;
   }
 
@@ -434,32 +466,39 @@
       group.userData.kind = 'node';
 
       const state = STATE_COLORS[node.state] ? node.state : 'default';
-      // Shared low-poly geometry; assign the shared per-state material directly.
-      // State changes swap the material reference (see _applyNodeColor) rather
-      // than mutating color, so we never touch a shared material's properties.
-      const sphere = new THREE.Mesh(SHARED.sphereGeo, SHARED.nodeMat[state]);
-      sphere.userData.uuid = node.uuid; // so raycast hits resolve to the node
-      sphere.userData.kind = 'node';
-      group.add(sphere);
-      group.userData.sphere = sphere;
+      const shape = node.shape || 'sphere';
+      group.userData.shape = shape;
 
-      // Outer glow shell (additive) reuses shared geometry + material.
-      const glow = new THREE.Mesh(SHARED.glowGeo, SHARED.glowMat[state]);
-      group.add(glow);
-      group.userData.glow = glow;
+      // Primary mesh + glow depend on the shape. All shapes expose the SAME
+      // userData contract (`sphere` = primary pickable mesh, `glow` = shell or
+      // null) so _applyNodeColor / raycasting / motion work uniformly.
+      if (shape === 'block') {
+        this._buildBlockMesh(group, node, state);
+      } else if (shape === 'bar') {
+        this._buildBarMesh(group, node, state);
+      } else if (shape === 'bucket') {
+        this._buildBucketMesh(group, node, state);
+      } else {
+        this._buildSphereMesh(group, node, state);
+      }
 
       // Precompute an AABB half-extent (world units) for cheap proximity tests.
       group.userData.aabbHalf = NODE_RADIUS * 1.35;
 
-      // Value label as a camera-facing sprite.
-      const tex = this._labelTexture(node.value);
+      // Value label as a camera-facing sprite (buckets label their index instead).
+      const labelVal = shape === 'bucket' && node.meta && node.meta.bucket !== undefined
+        ? '#' + node.meta.bucket
+        : node.value;
+      const tex = this._labelTexture(labelVal);
       const sprite = new THREE.Sprite(
         new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false })
       );
       sprite.scale.set(2.2, 2.2, 1);
       group.add(sprite);
       group.userData.sprite = sprite;
-      group.userData.labelValue = node.value;
+      group.userData.labelValue = labelVal;
+      // Bars carry their label above the bar top; others center it.
+      group.userData.labelShape = shape;
 
       group.position.set(node.position.x, node.position.y, node.position.z);
       // Start small and pop in.
@@ -468,8 +507,74 @@
       group.userData.targetPos = new THREE.Vector3(
         node.position.x, node.position.y, node.position.z
       );
+      // Remember meta so setModel can detect changes (bar height, bucket index).
+      group.userData.meta = node.meta ? Object.assign({}, node.meta) : null;
+      this._applyNodeMeta(group, node);
       return group;
     }
+
+    /** Default glowing-sphere primary (data-structure nodes, graph/tree/list). */
+    _buildSphereMesh(group, node, state) {
+      const sphere = new THREE.Mesh(SHARED.sphereGeo, SHARED.nodeMat[state]);
+      sphere.userData.uuid = node.uuid;
+      sphere.userData.kind = 'node';
+      group.add(sphere);
+      group.userData.sphere = sphere;
+      const glow = new THREE.Mesh(SHARED.glowGeo, SHARED.glowMat[state]);
+      group.add(glow);
+      group.userData.glow = glow;
+    }
+
+    /** Glass block primary (stack / queue cells). */
+    _buildBlockMesh(group, node, state) {
+      const mesh = new THREE.Mesh(SHARED.dsBlockGeo, SHARED.dsSolidMat[state]);
+      mesh.userData.uuid = node.uuid;
+      mesh.userData.kind = 'node';
+      group.add(mesh);
+      group.userData.sphere = mesh;   // primary
+      group.userData.glow = null;
+    }
+
+    /** Sorting bar primary — unit box scaled on Y by node.meta.height. */
+    _buildBarMesh(group, node, state) {
+      const mesh = new THREE.Mesh(SHARED.barGeo, SHARED.dsSolidMat[state]);
+      mesh.userData.uuid = node.uuid;
+      mesh.userData.kind = 'node';
+      group.add(mesh);
+      group.userData.sphere = mesh;
+      group.userData.glow = null;
+      group.userData.isBar = true;
+    }
+
+    /** Hash bucket tray primary — a fixed neutral frame (state-agnostic). */
+    _buildBucketMesh(group, node, state) {
+      const mesh = new THREE.Mesh(SHARED.bucketGeo, SHARED.bucketMat);
+      mesh.userData.uuid = node.uuid;
+      mesh.userData.kind = 'node';
+      group.add(mesh);
+      group.userData.sphere = mesh;
+      group.userData.glow = null;
+      group.userData.isBucket = true;
+    }
+
+    /**
+     * Apply meta-driven geometry (bar height, label offset) for a node group.
+     * Bars scale their mesh on Y and re-anchor the base to y=0; the sprite floats
+     * above the bar top. Cheap; called on create and when meta changes.
+     */
+    _applyNodeMeta(group, node) {
+      const meta = node.meta || {};
+      if (group.userData.isBar) {
+        const h = Math.max(0.4, Number(meta.height) || 1);
+        const mesh = group.userData.sphere;
+        mesh.scale.set(1, h, 1);
+        mesh.position.set(0, h / 2, 0);          // base pinned to group origin
+        if (group.userData.sprite) group.userData.sprite.position.set(0, h + 1.0, 0);
+      } else if (group.userData.sprite) {
+        group.userData.sprite.position.set(0, 0, 0);
+      }
+    }
+
 
     /* ---------------------------------------------------------------------
      * Build an edge group: glowing cylinder + optional cone arrowhead.
@@ -511,18 +616,35 @@
       for (const node of nodes) {
         seenNodes.add(node.uuid);
         let group = this.nodeMeshes.get(node.uuid);
-        if (!group) {
+        const wantShape = node.shape || 'sphere';
+        // Rebuild if missing OR the shape changed (a uuid should keep one shape,
+        // but guard so a structure swap can't leave a stale mesh kind).
+        if (!group || group.userData.shape !== wantShape) {
+          if (group) {
+            this._disposeGroup(group);
+            this.field.remove(group);
+          }
           group = this._createNodeMesh(node);
           this.nodeMeshes.set(node.uuid, group);
           this.field.add(group);
         }
         // Update label only if the value changed (BST delete copies values).
-        if (group.userData.labelValue !== node.value) {
+        const wantLabel = wantShape === 'bucket' && node.meta && node.meta.bucket !== undefined
+          ? '#' + node.meta.bucket
+          : node.value;
+        if (group.userData.labelValue !== wantLabel) {
           const oldMap = group.userData.sprite.material.map;
-          group.userData.sprite.material.map = this._labelTexture(node.value);
+          group.userData.sprite.material.map = this._labelTexture(wantLabel);
           group.userData.sprite.material.needsUpdate = true;
           if (oldMap) oldMap.dispose();
-          group.userData.labelValue = node.value;
+          group.userData.labelValue = wantLabel;
+        }
+        // Re-apply meta-driven geometry (bar height) when it changes.
+        const prevH = group.userData.meta ? group.userData.meta.height : undefined;
+        const nextH = node.meta ? node.meta.height : undefined;
+        if (prevH !== nextH) {
+          group.userData.meta = node.meta ? Object.assign({}, node.meta) : null;
+          this._applyNodeMeta(group, node);
         }
         // Update target position (lerped in the loop).
         group.userData.targetPos.set(
@@ -569,11 +691,18 @@
     }
 
     _applyNodeColor(group, state) {
+      // Buckets are a fixed neutral tray — never recolor by state.
+      if (group.userData.isBucket) return;
       const key = SHARED.nodeMat[state] ? state : 'default';
       if (group.userData.state === key) return; // no-op if unchanged
-      // Swap to the pre-built shared material — no property mutation, no alloc.
-      group.userData.sphere.material = SHARED.nodeMat[key];
-      group.userData.glow.material = SHARED.glowMat[key];
+      if (group.userData.shape && group.userData.shape !== 'sphere') {
+        // Block/bar: solid material, no glow shell.
+        group.userData.sphere.material = SHARED.dsSolidMat[key];
+      } else {
+        // Swap to the pre-built shared material — no property mutation, no alloc.
+        group.userData.sphere.material = SHARED.nodeMat[key];
+        if (group.userData.glow) group.userData.glow.material = SHARED.glowMat[key];
+      }
       group.userData.state = key;
     }
 
@@ -1017,12 +1146,26 @@
       this._la3D = false;
       this._laVectors = [];          // Array<{ id, v:Vector3, arrow:ArrowHelper }>
       this._laVecNextId = 1;
+      // Snap-to-integer while dragging basis tips (off by default). Lets the
+      // user set clean matrices like [[2,0],[0,1]] by hand instead of fighting
+      // sub-pixel float drift.
+      this._laSnap = false;
+      // Overlay toggles (Phase 5/6). Eigenvectors: real eigenvectors of the
+      // CURRENT matrix drawn as gold arrows (the directions that only scale,
+      // never rotate). Det shape: the parallelogram/parallelepiped spanned by
+      // the basis columns — its area/volume equals |det|.
+      this._laShowEigen = false;
+      this._laShowDet = false;
       // A modest three-plane 3D lattice (XY/XZ/YZ) + Z axis, hidden until 3D mode.
       this._laBuild3DGrid();
 
       // Bright X/Y axes + integer number labels on the STATIC reference frame,
       // so the moving grid can be read against a fixed Cartesian coordinate system.
       this._laBuildAxes();
+
+      // Eigenvector overlay arrows (pooled) + determinant shape mesh.
+      this._laBuildEigen();
+      this._laBuildDetShape();
 
       // Seed geometry + arrows at identity.
       this._laApplyDisplayed(IDENTITY3.slice());
@@ -1073,9 +1216,9 @@
      * A number sprite backed by its OWN canvas + texture so the digits can be
      * rewritten in place via _laSetLabel. Camera-facing; sized in world units.
      */
-    _laMakeLabel(text) {
+    _laMakeLabel(text, w, h) {
       const cvs = document.createElement('canvas');
-      cvs.width = 64; cvs.height = 64;
+      cvs.width = w || 64; cvs.height = h || 64;
       const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
         map: new THREE.CanvasTexture(cvs), transparent: true,
         depthWrite: false, depthTest: false,
@@ -1087,18 +1230,32 @@
       return sprite;
     }
 
-    /** Rewrite a pooled label sprite's text in place (skips redundant redraws). */
-    _laSetLabel(sprite, text) {
-      if (sprite.userData.text === text) return;
-      sprite.userData.text = text;
+    /**
+     * Rewrite a pooled label sprite's text in place (skips redundant redraws).
+     * `color` defaults to the axis-tick blue; vector labels pass their own tint.
+     * Font auto-shrinks so longer strings like "(2, 1, 3)" still fit the canvas.
+     */
+    _laSetLabel(sprite, text, color) {
+      const fill = color || '#8fb3c2';
+      // Key on text+color so a colour-only change still redraws.
+      const key = text + '|' + fill;
+      if (sprite.userData.text === key) return;
+      sprite.userData.text = key;
       const cvs = sprite.userData.canvas;
       const ctx = cvs.getContext('2d');
-      ctx.clearRect(0, 0, 64, 64);
-      ctx.fillStyle = '#8fb3c2';
-      ctx.font = 'bold 30px "SFMono-Regular", Consolas, monospace';
+      ctx.clearRect(0, 0, cvs.width, cvs.height);
+      ctx.fillStyle = fill;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText(text, 32, 34);
+      // Shrink font until the text fits within ~90% of the canvas width.
+      let size = 30;
+      const maxW = cvs.width * 0.9;
+      do {
+        ctx.font = `bold ${size}px "SFMono-Regular", Consolas, monospace`;
+        if (ctx.measureText(text).width <= maxW || size <= 12) break;
+        size -= 2;
+      } while (size > 12);
+      ctx.fillText(text, cvs.width / 2, cvs.height / 2 + 2);
       sprite.material.map.needsUpdate = true;
     }
 
@@ -1203,7 +1360,31 @@
         } else {
           rec.arrow.visible = false;
         }
+        // Live coordinate label: sits just past the transformed tip, showing the
+        // current (rounded) components so the user reads M·v as it animates.
+        if (rec.label) {
+          if (len > 1e-6) {
+            rec.label.visible = true;
+            const r = (n) => {
+              const v = Math.round(n * 100) / 100;
+              return Object.is(v, -0) ? 0 : v;
+            };
+            this._laSetLabel(rec.label, `(${r(x)}, ${r(y)}, ${r(z)})`, rec.label.userData.color);
+            // Offset outward along the vector so the label clears the arrowhead.
+            const off = 0.6 + len * 0.04;
+            rec.label.position.set(
+              x + (x / len) * off,
+              y + (y / len) * off + 0.3,
+              z + (z / len) * off
+            );
+          } else {
+            rec.label.visible = false;
+          }
+        }
       }
+      // Overlays track the live matrix as it animates.
+      if (this._laShowEigen) this._laUpdateEigen(m);
+      if (this._laShowDet) this._laUpdateDetShape(m);
     }
 
     /**
@@ -1271,6 +1452,36 @@
       this.laGroup.add(this._laZAxis);
     }
 
+    /** Pool of up to 3 gold eigenvector arrows (both directions ± per eigen). */
+    _laBuildEigen() {
+      this._laEigenArrows = [];
+      for (let i = 0; i < 6; i++) {
+        const a = this._makeBasisArrow(0xffcf3f);   // gold
+        a.visible = false;
+        this.laGroup.add(a);
+        this._laEigenArrows.push(a);
+      }
+    }
+
+    /**
+     * Build the determinant shape: a translucent gold mesh spanning the basis
+     * columns — a quad (2D parallelogram) that in 3D is extended to a box
+     * (parallelepiped). Geometry is rewritten each frame from the live columns.
+     */
+    _laBuildDetShape() {
+      const geo = new THREE.BufferGeometry();
+      // Max 36 verts (12 triangles) for the parallelepiped; 2D uses the first 6.
+      geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(36 * 3), 3));
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xffcf3f, transparent: true, opacity: 0.16,
+        side: THREE.DoubleSide, depthWrite: false,
+      });
+      this._laDetMesh = new THREE.Mesh(geo, mat);
+      this._laDetMesh.frustumCulled = false;
+      this._laDetMesh.visible = false;
+      this.laGroup.add(this._laDetMesh);
+    }
+
     /**
      * Switch between flat 2D and full 3D. 3D is a strict superset: the 2D floor
      * (`_laLiveGrid` + `_laRefGrid`) stays visible and we simply reveal the
@@ -1298,6 +1509,130 @@
       this._laApplyDisplayed(this._laDisplayed.slice());
     }
 
+    /** Toggle integer snap-to-grid while dragging basis-vector tips. */
+    setLaSnap(on) {
+      this._laSnap = !!on;
+    }
+
+    /** Toggle the eigenvector overlay (recomputed live from the matrix). */
+    setLaEigen(on) {
+      this._laShowEigen = !!on;
+      if (!on) for (const a of this._laEigenArrows) a.visible = false;
+      else this._laUpdateEigen(this._laDisplayed);
+    }
+
+    /** Toggle the determinant area/volume shading. */
+    setLaDet(on) {
+      this._laShowDet = !!on;
+      this._laDetMesh.visible = !!on;
+      if (on) this._laUpdateDetShape(this._laDisplayed);
+    }
+
+    /**
+     * Real eigenvectors of the current matrix, drawn as gold arrows (±each).
+     * In 2D we solve the in-plane 2×2 block [[a,c],[b,d]] (column-major
+     * m0,m1,m3,m4); complex eigenvalues (pure rotation) → no real overlay.
+     * In 3D we additionally test the z-axis block for an axis-aligned eigenpair
+     * (the common teaching case: rotation/scale about z). Full 3×3 arbitrary
+     * eigen-solving needs a cubic root-finder — deferred; the 2×2 + z cases
+     * cover every preset and the most instructive hand-built matrices.
+     */
+    _laUpdateEigen(m) {
+      const arrows = this._laEigenArrows;
+      for (const a of arrows) a.visible = false;
+      if (!this._laShowEigen) return;
+
+      const dirs = [];   // Array<Vector3> unit eigen-directions
+      // --- in-plane 2×2 block ---
+      const a = m[0], b = m[1], c = m[3], d = m[4];
+      const tr = a + d;
+      const det = a * d - b * c;
+      const disc = tr * tr / 4 - det;
+      if (disc >= -1e-9) {
+        const s = Math.sqrt(Math.max(0, disc));
+        for (const lam of [tr / 2 + s, tr / 2 - s]) {
+          // Solve (M-λI)v = 0 for the 2×2 block [[a-λ, c],[b, d-λ]]. The null
+          // direction of row 0 (a-λ, c) is (-c, a-λ); of row 1 (b, d-λ) is
+          // (d-λ, -b). Use whichever row has the larger norm (more reliable).
+          const r0 = Math.hypot(a - lam, c);
+          const r1 = Math.hypot(b, d - lam);
+          let vx, vy;
+          if (r0 >= r1 && r0 > 1e-6) { vx = -c; vy = a - lam; }
+          else if (r1 > 1e-6) { vx = d - lam; vy = -b; }
+          else { vx = 1; vy = 0; }                    // M=λI: any vector; pick x
+          const L = Math.hypot(vx, vy);
+          if (L > 1e-6) dirs.push(new THREE.Vector3(vx / L, vy / L, 0));
+        }
+      }
+      // --- z-axis eigenpair (only meaningful in 3D) ---
+      if (this._la3D) {
+        const zcol = new THREE.Vector3(m[2], m[5], m[8]);
+        // z is an eigenvector iff the z-column is parallel to (0,0,1).
+        if (Math.abs(m[2]) < 1e-6 && Math.abs(m[5]) < 1e-6 && Math.abs(m[8]) > 1e-6) {
+          dirs.push(new THREE.Vector3(0, 0, 1));
+        }
+      }
+
+      // Draw ±each unique direction as a unit gold arrow.
+      let idx = 0;
+      const seen = [];
+      for (const dir of dirs) {
+        if (seen.some((s) => Math.abs(s.dot(dir)) > 0.999)) continue;  // dedupe
+        seen.push(dir);
+        for (const sign of [1, -1]) {
+          if (idx >= arrows.length) break;
+          const ar = arrows[idx++];
+          ar.visible = true;
+          ar.setDirection(dir.clone().multiplyScalar(sign));
+          ar.setLength(3.2, 0.5, 0.28);
+        }
+      }
+    }
+
+    /**
+     * Rewrite the determinant shape from the live basis columns. 2D: the
+     * parallelogram O, î, î+ĵ, ĵ (two triangles). 3D: the parallelepiped
+     * spanned by î, ĵ, k̂ (12 triangles). Area/volume == |det|.
+     */
+    _laUpdateDetShape(m) {
+      if (!this._laShowDet) return;
+      const attr = this._laDetMesh.geometry.getAttribute('position');
+      const arr = attr.array;
+      const i = [m[0], m[1], m[2]];
+      const j = [m[3], m[4], m[5]];
+      const k = [m[6], m[7], m[8]];
+      let n = 0;
+      const put = (p) => { arr[n++] = p[0]; arr[n++] = p[1]; arr[n++] = p[2]; };
+      const O = [0, 0, 0];
+      const add = (u, v) => [u[0] + v[0], u[1] + v[1], u[2] + v[2]];
+      if (!this._la3D) {
+        // Parallelogram O, i, i+j / O, i+j, j
+        const ij = add(i, j);
+        put(O); put(i); put(ij);
+        put(O); put(ij); put(j);
+        for (; n < arr.length; n++) arr[n] = 0;
+      } else {
+        // 8 corners of the parallelepiped.
+        const c000 = O, c100 = i, c010 = j, c001 = k;
+        const c110 = add(i, j), c101 = add(i, k), c011 = add(j, k);
+        const c111 = add(add(i, j), k);
+        const quad = (p, q, r, s) => { put(p); put(q); put(r); put(p); put(r); put(s); };
+        quad(c000, c100, c110, c010);   // bottom (k=0)
+        quad(c001, c101, c111, c011);   // top (k=1)
+        quad(c000, c100, c101, c001);   // front (j=0)
+        quad(c010, c110, c111, c011);   // back (j=1)
+        quad(c000, c010, c011, c001);   // left (i=0)
+        quad(c100, c110, c111, c101);   // right (i=1)
+      }
+      attr.needsUpdate = true;
+    }
+
+    /** Set the matrix-transition duration in seconds (clamped to a sane range). */
+    setLaSpeed(seconds) {
+      const s = Number(seconds);
+      if (Number.isFinite(s)) this.LA_LERP_TIME = Math.max(0.1, Math.min(6, s));
+    }
+
     /** Colour ramp for successive user vectors (cycles). */
     _laVecColor(i) {
       const ramp = [0xffd166, 0x06d6a0, 0xef476f, 0x118ab2, 0xf78c6b, 0x9b5de5];
@@ -1313,11 +1648,31 @@
       const color = this._laVecColor(this._laVecNextId - 1);
       const arrow = this._makeBasisArrow(color);
       this.laGroup.add(arrow);
-      const rec = { id: this._laVecNextId++, v: new THREE.Vector3(x, y, z), arrow };
+      // A floating coordinate label that rides the transformed tip, tinted to
+      // match the arrow so it's easy to tell which vector it belongs to. Wider
+      // canvas than the axis ticks so "(x, y, z)" stays crisp.
+      const label = this._laMakeLabel('', 160, 48);
+      label.scale.set(2.2, 0.66, 1);
+      label.userData.color = '#' + color.toString(16).padStart(6, '0');
+      this.laGroup.add(label);
+      const rec = { id: this._laVecNextId++, v: new THREE.Vector3(x, y, z), arrow, label };
       this._laVectors.push(rec);
       // Position it against whatever is currently displayed.
       this._laApplyDisplayed(this._laDisplayed.slice());
       return { id: rec.id, color };
+    }
+
+    /** Dispose one vector record's scene objects (arrow + label). */
+    _laDisposeVecRec(rec) {
+      this.laGroup.remove(rec.arrow);
+      if (rec.arrow.dispose) rec.arrow.dispose();
+      if (rec.label) {
+        this.laGroup.remove(rec.label);
+        if (rec.label.material) {
+          if (rec.label.material.map) rec.label.material.map.dispose();
+          rec.label.material.dispose();
+        }
+      }
     }
 
     /** Remove a user vector by id. */
@@ -1325,16 +1680,12 @@
       const i = this._laVectors.findIndex((r) => r.id === id);
       if (i === -1) return;
       const [rec] = this._laVectors.splice(i, 1);
-      this.laGroup.remove(rec.arrow);
-      if (rec.arrow.dispose) rec.arrow.dispose();
+      this._laDisposeVecRec(rec);
     }
 
     /** Remove all user vectors (called on exit/reset). */
     laClearVectors() {
-      for (const rec of this._laVectors) {
-        this.laGroup.remove(rec.arrow);
-        if (rec.arrow.dispose) rec.arrow.dispose();
-      }
+      for (const rec of this._laVectors) this._laDisposeVecRec(rec);
       this._laVectors = [];
     }
 
@@ -1368,6 +1719,9 @@
       this._laActive = false;
       this.laGroup.visible = false;
       this.laClearVectors();
+      // Reset overlays so re-entering starts clean.
+      this.setLaEigen(false);
+      this.setLaDet(false);
       for (const g of this.nodeMeshes.values()) g.visible = true;
       for (const g of this.edgeMeshes.values()) g.visible = true;
       this.grid.visible = true;
@@ -1578,6 +1932,12 @@
 
       // World hit → field-local, which is the space the matrix columns live in.
       const local = this.field.worldToLocal(hitW.clone());
+      // Optional integer snap so clean matrices are easy to dial in by hand.
+      if (this._laSnap) {
+        local.x = Math.round(local.x);
+        local.y = Math.round(local.y);
+        local.z = Math.round(local.z);
+      }
       const m = this._laDisplayed;
       m[i * 3] = local.x;
       m[i * 3 + 1] = local.y;
@@ -2440,9 +2800,12 @@
         group.position.lerp(group.userData.targetPos, LERP);
         const s = group.scale.x + (group.userData.targetScale - group.scale.x) * LERP;
         group.scale.setScalar(s);
-        // Subtle idle bob so glass spheres feel alive.
+        // Subtle idle spin so glass spheres feel alive — spheres only (a
+        // spinning bar/block/bucket would look wrong).
         const sphere = group.userData.sphere;
-        if (sphere) sphere.rotation.y = t * 0.4;
+        if (sphere && (!group.userData.shape || group.userData.shape === 'sphere')) {
+          sphere.rotation.y = t * 0.4;
+        }
       }
 
       // Re-seat edges after nodes moved.
