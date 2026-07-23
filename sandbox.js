@@ -379,54 +379,86 @@
    * reads over a buffered queue. Skulpt is synchronous; the outer
    * HARD_TIMEOUT_MS terminate() in the main thread is the infinite-loop guard.
    * ------------------------------------------------------------------ */
+  /* ---------------------------------------------------------------------
+   * PYTHON worker body (Skulpt). Runs the user's Python, auto-instruments
+   * every top-level def to emit @VIS:CALL/@VIS:RET (which drive the 3D
+   * stack tower + call tree), and streams all other stdout to the terminal.
+   * @VIS:HIGHLIGHT/NODE/EDGE printed by the user still work unchanged.
+   * ------------------------------------------------------------------ */
   function pyWorkerSource(skulptUrl, stdlibUrl) {
     return `
+      var __skReady = false;
       try {
         importScripts(${JSON.stringify(skulptUrl)});
         importScripts(${JSON.stringify(stdlibUrl)});
+        __skReady = true;
       } catch (e) {
         self.postMessage({ type: 'error', message: 'Failed to load Skulpt from CDN: ' + e.message });
         self.postMessage({ type: 'done' });
-        return;
+      }
+
+      // AUTO-INSTRUMENTATION: prepend a __viz decorator harness and inject
+      // @__viz above every column-0 def so call/return emit @VIS:CALL/@VIS:RET.
+      // Recursive calls are captured because the wrapper replaces the global name.
+      function instrumentPython(code) {
+        var harness = [
+          'def __viz(fn):',
+          '    def __vizwrap(*a, **k):',
+          '        try:',
+          '            _args = ", ".join([repr(x) for x in a])',
+          '        except:',
+          '            _args = ""',
+          '        print("@VIS:CALL:" + fn.__name__ + "(" + _args + "):" + _args)',
+          '        _r = fn(*a, **k)',
+          '        try:',
+          '            _rv = repr(_r)',
+          '        except:',
+          '            _rv = ""',
+          '        print("@VIS:RET:" + _rv)',
+          '        return _r',
+          '    return __vizwrap',
+          ''
+        ].join('\\n');
+        var lines = code.split('\\n');
+        var out = [];
+        var defRe = /^def\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*\\(/;
+        var any = false;
+        for (var i = 0; i < lines.length; i++) {
+          var m = defRe.exec(lines[i]);
+          if (m && m[1] !== '__viz') { out.push('@__viz'); any = true; }
+          out.push(lines[i]);
+        }
+        return any ? (harness + '\\n' + out.join('\\n')) : code;
       }
 
       self.onmessage = function (ev) {
+        if (!__skReady) return;
         var code = ev.data && ev.data.code;
         if (typeof code !== 'string') return;
         var stdin = (ev.data && typeof ev.data.stdin === 'string') ? ev.data.stdin : '';
 
-        // Feed stdin line-by-line to input()/raw_input(). Skulpt calls inputfun
-        // per read; we hand back one line at a time (trailing newline stripped).
         var inLines = stdin.length ? stdin.replace(/\\n$/, '').split('\\n') : [];
         var inPtr = 0;
 
-        function outf(text) {
-          self.postMessage({ type: 'stdout', chunk: text });
-        }
+        function outf(text) { self.postMessage({ type: 'stdout', chunk: text }); }
         function readf(x) {
-          // Skulpt's module loader uses this to fetch builtin sources.
-          if (Sk.builtinFiles === undefined || Sk.builtinFiles.files[x] === undefined) {
+          if (Sk.builtinFiles === undefined || Sk.builtinFiles.files[x] === undefined)
             throw new Error("File not found: '" + x + "'");
-          }
           return Sk.builtinFiles.files[x];
         }
-        function inputf() {
-          return inPtr < inLines.length ? inLines[inPtr++] : '';
-        }
+        function inputf() { return inPtr < inLines.length ? inLines[inPtr++] : ''; }
+
+        var runCode = code;
+        try { runCode = instrumentPython(code); } catch(e) { runCode = code; }
 
         try {
           Sk.configure({
-            output: outf,
-            read: readf,
-            inputfun: inputf,
-            inputfunTakesPrompt: true,
-            __future__: Sk.python3,
-            execLimit: 8000,   // ms; coarse guard, terminate() is the real one
+            output: outf, read: readf, inputfun: inputf,
+            inputfunTakesPrompt: true, __future__: Sk.python3, execLimit: 8000,
           });
-          var promise = Sk.misceval.asyncToPromise(function () {
-            return Sk.importMainWithBody('<stdin>', false, code, true);
-          });
-          promise.then(function () {
+          Sk.misceval.asyncToPromise(function () {
+            return Sk.importMainWithBody('<stdin>', false, runCode, true);
+          }).then(function () {
             self.postMessage({ type: 'exit', code: 0 });
             self.postMessage({ type: 'done' });
           }, function (err) {
@@ -435,8 +467,7 @@
             self.postMessage({ type: 'done' });
           });
         } catch (e) {
-          var m = (e && e.toString) ? e.toString() : String(e);
-          self.postMessage({ type: 'error', message: m });
+          self.postMessage({ type: 'error', message: (e && e.toString) ? e.toString() : String(e) });
           self.postMessage({ type: 'done' });
         }
       };
